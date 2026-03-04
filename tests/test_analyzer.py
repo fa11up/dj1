@@ -30,7 +30,12 @@ from modules.analyzer import (
     analyze_library,
     CAMELOT_MAJOR,
     CAMELOT_MINOR,
+    BPM_NORM_LO,
+    BPM_NORM_HI,
     KEY_NAMES,
+    normalise_bpm,
+    detect_sections, 
+    SECTION_MIN_DURATION_SEC
 )
 
 # ── Minimal test framework ────────────────────────────────────────────────────
@@ -455,9 +460,209 @@ def test_analyze_library():
                    second_run_all_cache_hits, bpm_range_is_valid]:
             run_test(fn.__name__, fn)
 
+def test_normalise_bpm():
+    section("Unit Tests: normalise_bpm (P2-2)")
+
+    def already_in_range_unchanged():
+        bpm, corrected = normalise_bpm(128.0)
+        assert_approx(bpm, 128.0, tol=0.01)
+        assert_true(not corrected, "128 BPM should not be corrected")
+
+    def half_time_doubled():
+        # 78 BPM is half of 156 — should double into range
+        bpm, corrected = normalise_bpm(78.0)
+        assert_approx(bpm, 156.0, tol=0.01)
+        assert_true(corrected, "78 BPM should be corrected to 156")
+
+    def double_time_halved():
+        # 256 BPM is double of 128 — should halve into range
+        bpm, corrected = normalise_bpm(256.0)
+        assert_approx(bpm, 128.0, tol=0.01)
+        assert_true(corrected, "256 BPM should be corrected to 128")
+
+    def very_slow_doubled_multiple():
+        # 32 BPM → 64 → 128
+        bpm, corrected = normalise_bpm(32.0)
+        assert_approx(bpm, 128.0, tol=0.01)
+        assert_true(corrected)
+
+    def very_fast_halved_multiple():
+        # 512 BPM → 256 → 128
+        bpm, corrected = normalise_bpm(512.0)
+        assert_approx(bpm, 128.0, tol=0.01)
+        assert_true(corrected)
+
+    def dnb_range_stays():
+        # 174 BPM is valid DnB — should NOT be halved
+        bpm, corrected = normalise_bpm(174.0)
+        assert_approx(bpm, 174.0, tol=0.01)
+        assert_true(not corrected, "174 BPM is valid DnB, should not change")
+
+    def boundary_lo_stays():
+        bpm, corrected = normalise_bpm(80.0)
+        assert_approx(bpm, 80.0, tol=0.01)
+        assert_true(not corrected)
+
+    def boundary_hi_stays():
+        bpm, corrected = normalise_bpm(175.0)
+        assert_approx(bpm, 175.0, tol=0.01)
+        assert_true(not corrected)
+
+    def none_returns_none():
+        bpm, corrected = normalise_bpm(None)
+        assert_true(bpm is None)
+        assert_true(not corrected)
+
+    def zero_returns_zero():
+        bpm, corrected = normalise_bpm(0)
+        assert_eq(bpm, 0)
+        assert_true(not corrected)
+
+    def result_always_in_range():
+        """Fuzz test: any positive BPM should normalise into range."""
+        import random
+        rng = random.Random(42)
+        for _ in range(100):
+            raw = rng.uniform(20.0, 600.0)
+            bpm, _ = normalise_bpm(raw)
+            assert_in_range(bpm, BPM_NORM_LO, BPM_NORM_HI,
+                            f"normalise_bpm({raw}) = {bpm} outside range")
+
+    def analyze_track_has_bpm_fields():
+        """Integration: analyze_track result includes new P2-2 fields."""
+        import tempfile
+        wav = Path(tempfile.mktemp(suffix=".wav"))
+        make_wav_from_array(wav, make_click_track(bpm=120.0, duration=10.0))
+        track = make_track_stub("bpm_test", str(wav))
+        cache_dir = Path(tempfile.mkdtemp())
+        result = analyze_track(track, cache_dir)
+        assert_true("bpm_raw" in result, "Missing bpm_raw field")
+        assert_true("bpm_normalised" in result, "Missing bpm_normalised field")
+        assert_true("bpm_was_corrected" in result, "Missing bpm_was_corrected field")
+        assert_not_none(result["bpm"])
+        assert_not_none(result["bpm_raw"])
+        # Clean up
+        wav.unlink(missing_ok=True)
+
+    for fn in [already_in_range_unchanged, half_time_doubled, double_time_halved,
+               very_slow_doubled_multiple, very_fast_halved_multiple,
+               dnb_range_stays, boundary_lo_stays, boundary_hi_stays,
+               none_returns_none, zero_returns_zero, result_always_in_range,
+               analyze_track_has_bpm_fields]:
+        run_test(fn.__name__, fn)
+
+
+def test_detect_sections():
+    section("Unit Tests: detect_sections (P2-6)")
+
+    def returns_list():
+        y = make_sine(duration=30.0)
+        beat_times = [i * 0.5 for i in range(120)]
+        energy_curve = [0.5] * 32
+        result = detect_sections(y, SR, beat_times, energy_curve, 30.0)
+        assert_true(isinstance(result, list), "Should return a list")
+
+    def sections_have_required_keys():
+        y = make_sine(duration=30.0)
+        beat_times = [i * 0.5 for i in range(120)]
+        energy_curve = [0.5] * 32
+        result = detect_sections(y, SR, beat_times, energy_curve, 30.0)
+        if result:  # may be empty for simple sine
+            for sec in result:
+                for key in ["label", "start_sec", "end_sec", "energy", "energy_category"]:
+                    assert_true(key in sec, f"Missing key: {key} in section {sec}")
+
+    def sections_cover_track():
+        """Sections should not overlap and should span roughly the full track."""
+        # Build a more complex signal with energy changes
+        y_quiet = make_sine(freq=440.0, duration=10.0, amplitude=0.1)
+        y_loud  = make_sine(freq=440.0, duration=10.0, amplitude=0.8)
+        y_quiet2 = make_sine(freq=440.0, duration=10.0, amplitude=0.1)
+        y = np.concatenate([y_quiet, y_loud, y_quiet2])
+        duration = 30.0
+        beat_times = [i * 0.5 for i in range(120)]
+        energy_curve = ([0.2] * 11) + ([0.8] * 10) + ([0.2] * 11)
+        result = detect_sections(y, SR, beat_times, energy_curve, duration)
+        if result:
+            # Check no overlaps
+            for i in range(len(result) - 1):
+                assert_true(result[i]["end_sec"] <= result[i + 1]["start_sec"] + 0.1,
+                            f"Overlap: {result[i]} and {result[i+1]}")
+            # First section should start near 0
+            assert_true(result[0]["start_sec"] <= 1.0,
+                        f"First section starts too late: {result[0]['start_sec']}")
+
+    def sections_have_valid_labels():
+        y = make_sine(duration=30.0)
+        beat_times = [i * 0.5 for i in range(120)]
+        energy_curve = [0.5] * 32
+        result = detect_sections(y, SR, beat_times, energy_curve, 30.0)
+        valid_labels = {"intro", "outro", "verse", "chorus", "breakdown", "bridge", "drop"}
+        for sec in result:
+            assert_true(sec["label"] in valid_labels,
+                        f"Invalid label: {sec['label']}")
+
+    def energy_values_reasonable():
+        y = make_sine(duration=20.0)
+        beat_times = [i * 0.5 for i in range(80)]
+        energy_curve = [0.5] * 32
+        result = detect_sections(y, SR, beat_times, energy_curve, 20.0)
+        for sec in result:
+            assert_in_range(sec["energy"], 0.0, 1.5,
+                            f"Energy {sec['energy']} out of expected range")
+
+    def sections_respect_min_duration():
+        y = make_sine(duration=30.0)
+        beat_times = [i * 0.5 for i in range(120)]
+        energy_curve = [0.5] * 32
+        result = detect_sections(y, SR, beat_times, energy_curve, 30.0)
+        for sec in result:
+            dur = sec["end_sec"] - sec["start_sec"]
+            assert_true(dur >= SECTION_MIN_DURATION_SEC * 0.9,
+                        f"Section too short: {dur}s < {SECTION_MIN_DURATION_SEC}s")
+
+    def empty_audio_returns_empty():
+        y = np.zeros(SR * 2, dtype=np.float32)
+        result = detect_sections(y, SR, [], [], 2.0)
+        assert_true(isinstance(result, list))
+
+    def complex_signal_finds_sections():
+        """A signal with clear energy changes should produce multiple sections."""
+        # quiet → loud → quiet → loud → quiet
+        parts = []
+        for i, amp in enumerate([0.05, 0.8, 0.05, 0.8, 0.05]):
+            parts.append(make_sine(freq=440.0, duration=10.0, amplitude=amp))
+        y = np.concatenate(parts)
+        beat_times = [i * 0.5 for i in range(200)]
+        energy_curve = ([0.1] * 6) + ([0.9] * 7) + ([0.1] * 6) + ([0.9] * 7) + ([0.1] * 6)
+        result = detect_sections(y, SR, beat_times, energy_curve, 50.0)
+        # Should find at least 2 distinct sections
+        assert_true(len(result) >= 2,
+                    f"Complex signal should have ≥2 sections, got {len(result)}")
+
+    def analyze_track_has_sections_field():
+        """Integration: analyze_track result includes new sections field."""
+        import tempfile
+        wav = Path(tempfile.mktemp(suffix=".wav"))
+        make_wav_from_array(wav, make_click_track(bpm=120.0, duration=15.0))
+        track = make_track_stub("sec_test", str(wav))
+        cache_dir = Path(tempfile.mkdtemp())
+        result = analyze_track(track, cache_dir)
+        assert_true("sections" in result, "Missing 'sections' field in analysis result")
+        # May be empty list or populated — both are valid
+        assert_true(isinstance(result["sections"], (list, type(None))),
+                    f"sections should be list or None, got {type(result['sections'])}")
+        wav.unlink(missing_ok=True)
+
+    for fn in [returns_list, sections_have_required_keys, sections_cover_track,
+               sections_have_valid_labels, energy_values_reasonable,
+               sections_respect_min_duration, empty_audio_returns_empty,
+               complex_signal_finds_sections, analyze_track_has_sections_field]:
+        run_test(fn.__name__, fn)
+
+
 
 # ── Runner ────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     print("\n" + "═"*58)
     print("  🧪 AutoDJ — Module 2 Test Suite")
@@ -469,6 +674,8 @@ if __name__ == "__main__":
     test_intro_outro()
     test_analyze_track()
     test_analyze_library()
+    test_normalise_bpm()
+    test_detect_sections()
 
     total = _results["passed"] + _results["failed"]
     print(f"\n{'═'*58}")
@@ -480,3 +687,4 @@ if __name__ == "__main__":
     else:
         print(f"  Results: {_results['passed']}/{total} passed  🎉 All tests passed!")
     print("═"*58 + "\n")
+

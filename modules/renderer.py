@@ -81,6 +81,12 @@ PHASE_SWAP_BARS_TIGHT = 2    # chaos < 0.5
 PHASE_SWAP_BARS_LOOSE = 4    # chaos >= 0.5
 PHASE_OUTRO_BARS      = 16   # outgoing fades after bass swap
 
+# Looping (P2-1): extend outgoing track if outro is too short for a full blend
+LOOP_BARS_DEFAULT  = 4     # default loop length in bars
+LOOP_BARS_LONG     = 8     # longer loop for slow tempos
+LOOP_MAX_REPEATS   = 4     # max times to repeat the loop segment
+LOOP_MIN_CONTENT_MS = 8000 # minimum outgoing content after p2_start before looping kicks in
+
 # quick_fade and crossfade simple durations (ms) — no staging
 QUICK_FADE_MS  = 4_000
 CROSSFADE_MS   = 12_000
@@ -116,6 +122,69 @@ def bars_to_ms(bars, bpm):
     if not bpm or bpm <= 0:
         bpm = 120.0
     return int(bars * 4 * 60.0 / bpm * 1000)
+
+
+def loop_segment(seg, loop_bars, bpm, beat_times=None):
+    """
+    Extract the last `loop_bars` bars from a segment and loop them to create
+    an extended version. Returns the looped audio (just the loop repetitions,
+    NOT the original segment).
+
+    The loop point snaps to the nearest beat boundary for a clean splice.
+    Uses simple pydub concatenation — the loop is musically identical content
+    repeated, so no time-stretching is needed.
+
+    Args:
+        seg:        AudioSegment to extract loop from
+        loop_bars:  number of bars to loop (typically 4 or 8)
+        bpm:        tempo for bar duration calculation
+        beat_times: list of beat timestamps in seconds (for beat-snapping)
+
+    Returns:
+        (loop_audio, loop_point_ms):
+            loop_audio    = AudioSegment of the repeated loop
+            loop_point_ms = position in original seg where the loop was taken from
+    """
+    loop_ms = bars_to_ms(loop_bars, bpm)
+
+    # Don't loop if the segment is too short
+    if len(seg) < loop_ms * 1.5:
+        return AudioSegment.silent(duration=0, frame_rate=SAMPLE_RATE), len(seg)
+
+    # Find the loop start point — ideally on a beat/phrase boundary
+    raw_loop_start = len(seg) - loop_ms
+
+    if beat_times:
+        # Snap to nearest beat boundary at or before raw_loop_start
+        target_sec = raw_loop_start / 1000.0
+        candidates = [b for b in beat_times if b <= target_sec]
+        if candidates:
+            loop_start_ms = int(candidates[-1] * 1000)
+        else:
+            loop_start_ms = raw_loop_start
+    else:
+        loop_start_ms = raw_loop_start
+
+    loop_start_ms = max(0, loop_start_ms)
+
+    # Extract the loop region
+    loop_region = seg[loop_start_ms:]
+
+    # Repeat the loop region (up to LOOP_MAX_REPEATS times)
+    # Apply a tiny crossfade at each join to avoid clicks
+    loop_audio = AudioSegment.silent(duration=0, frame_rate=SAMPLE_RATE)
+    xfade_ms = min(50, len(loop_region) // 4)  # tiny crossfade for seamless joins
+
+    for i in range(LOOP_MAX_REPEATS):
+        if len(loop_audio) == 0:
+            loop_audio = loop_region
+        else:
+            if xfade_ms > 0 and len(loop_audio) > xfade_ms and len(loop_region) > xfade_ms:
+                loop_audio = loop_audio.append(loop_region, crossfade=xfade_ms)
+            else:
+                loop_audio = loop_audio + loop_region
+
+    return loop_audio, loop_start_ms
 
 
 def find_phrase_boundary(beat_times_sec, target_ms, phrase_beats=PHRASE_BEATS):
@@ -170,6 +239,53 @@ def find_breakdown_point(energy_curve, outro_start_ratio=0.6):
     min_val    = min(window)
     min_idx    = start_idx + window.index(min_val)
     return min_idx
+
+
+def find_breakdown_from_sections(sections, outro_start_ratio=0.55, track_duration_ms=None):
+    """
+    Find the best breakdown point using structural section data from P2-6.
+
+    Looks for sections labelled "breakdown" in the latter portion of the track.
+    If no breakdown is found, looks for any low-energy section near the end.
+
+    Returns breakdown position in milliseconds, or None if no suitable point found.
+    """
+    if not sections or not track_duration_ms:
+        return None
+
+    track_dur_sec = track_duration_ms / 1000.0
+    search_start  = track_dur_sec * outro_start_ratio
+
+    # Priority 1: explicitly labelled breakdowns after the search start
+    breakdowns = [
+        s for s in sections
+        if s["label"] == "breakdown" and s["start_sec"] >= search_start
+    ]
+    if breakdowns:
+        # Pick the one closest to the end (best for transition timing)
+        best = max(breakdowns, key=lambda s: s["start_sec"])
+        return int(best["start_sec"] * 1000)
+
+    # Priority 2: any low-energy section in the latter portion
+    low_energy = [
+        s for s in sections
+        if s.get("energy_category") == "low" and s["start_sec"] >= search_start
+        and s["label"] not in ("intro",)  # don't use intro sections
+    ]
+    if low_energy:
+        best = max(low_energy, key=lambda s: s["start_sec"])
+        return int(best["start_sec"] * 1000)
+
+    # Priority 3: transition between chorus→verse or chorus→bridge
+    for i in range(len(sections) - 1):
+        curr = sections[i]
+        nxt  = sections[i + 1]
+        if (nxt["start_sec"] >= search_start
+            and curr.get("energy_category") == "high"
+            and nxt.get("energy_category") in ("mid", "low")):
+            return int(nxt["start_sec"] * 1000)
+
+    return None
 
 
 def segment_idx_to_ms(seg_idx, total_ms, n_segments=32):
@@ -557,26 +673,46 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
     # Highs cutoff: 4× bass crossover, clamped to 400–1200Hz
     highs_hz   = max(400.0, min(1200.0, bass_hz * 4))
 
-    # ── Find breakdown point — hold transition until energy dips ──────────────
-    energy_curve = (slot_out.get("energy") or {}).get("curve") or []
-    breakdown_idx = find_breakdown_point(energy_curve, outro_start_ratio=0.55)
-    if breakdown_idx is not None and beat_times:
-        breakdown_ms = segment_idx_to_ms(breakdown_idx, len(outgoing))
-        # Now find the next phrase boundary at or after the breakdown
-        phrase_ms = find_phrase_boundary(beat_times, breakdown_ms)
+    # ── Find breakdown point — prefer structural sections (P2-6) ─────────────
+    sections = slot_out.get("sections") or []
+    breakdown_ms_from_sections = find_breakdown_from_sections(
+        sections, outro_start_ratio=0.55, track_duration_ms=len(outgoing)
+    )
+
+    if breakdown_ms_from_sections is not None and beat_times:
+        # Sections found a breakdown — use it
+        phrase_ms = find_phrase_boundary(beat_times, breakdown_ms_from_sections)
         phrase_ms = min(phrase_ms, int(len(outgoing) * 0.82))
         total_available = len(outgoing) - phrase_ms
         if total_available >= total_ms * 0.5:
-            # Good — we have room. Redistribute if needed.
             if total_available < total_ms:
                 scale    = total_available / total_ms
                 highs_ms = int(highs_ms * scale)
                 swap_ms  = max(int(swap_ms * scale), 500)
                 outro_ms = int(outro_ms * scale)
                 total_ms = highs_ms + swap_ms + outro_ms
-        # else: breakdown too late in track, fall through to normal phrase align
 
-    # ── Phrase align the splice point (if breakdown search didn't already) ─────
+    # ── Fallback: energy curve breakdown detection ────────────────────────────
+    elif breakdown_ms_from_sections is None:
+        energy_curve = (slot_out.get("energy") or {}).get("curve") or []
+        breakdown_idx = find_breakdown_point(energy_curve, outro_start_ratio=0.55)
+        if breakdown_idx is not None and beat_times:
+            breakdown_ms = segment_idx_to_ms(breakdown_idx, len(outgoing))
+            # Now find the next phrase boundary at or after the breakdown
+            phrase_ms = find_phrase_boundary(beat_times, breakdown_ms)
+            phrase_ms = min(phrase_ms, int(len(outgoing) * 0.82))
+            total_available = len(outgoing) - phrase_ms
+            if total_available >= total_ms * 0.5:
+                # Good — we have room. Redistribute if needed.
+                if total_available < total_ms:
+                    scale    = total_available / total_ms
+                    highs_ms = int(highs_ms * scale)
+                    swap_ms  = max(int(swap_ms * scale), 500)
+                    outro_ms = int(outro_ms * scale)
+                    total_ms = highs_ms + swap_ms + outro_ms
+            # else: breakdown too late in track, fall through to normal phrase align
+
+    # ── Phrase align the splice point (if breakdown search didn't already) ────
     elif strategy["do_phrase_align"] and beat_times:
         target_ms  = max(0, len(outgoing) - total_ms)
         aligned_ms = find_phrase_boundary(beat_times, target_ms)
@@ -613,6 +749,27 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
         bpm_in  = slot_in.get("actual_bpm")
         bpm_out = slot_out.get("actual_bpm")
         incoming = _stretch_incoming(incoming, bpm_in, bpm_out, total_ms)
+
+    # ── Looping: extend outgoing if outro too short for blend (P2-1) ──────────
+    p2_start_tentative = max(0, len(outgoing) - total_ms)
+    tail_available_ms  = len(outgoing) - p2_start_tentative
+
+    # Decide loop length: 8 bars for slow BPM, 4 bars for fast
+    loop_bars = LOOP_BARS_LONG if bpm < 120 else LOOP_BARS_DEFAULT
+    loop_ms   = bars_to_ms(loop_bars, bpm)
+
+    # Loop if: (a) not enough outgoing content for the blend, or
+    #          (b) always loop to keep energy steady during transition
+    needs_loop = (tail_available_ms < total_ms) or (tail_available_ms < total_ms * 1.2)
+
+    if needs_loop and loop_ms > 0 and len(outgoing) > loop_ms * 1.5:
+        loop_audio, loop_point_ms = loop_segment(
+            outgoing, loop_bars, bpm, beat_times
+        )
+        if len(loop_audio) > 0:
+            # Splice: keep outgoing up to the loop point, then append loop
+            # This extends the outgoing track with repeated bars
+            outgoing = outgoing[:loop_point_ms] + loop_audio
 
     # ── Slice regions ──────────────────────────────────────────────────────────
     # outgoing: body | phase2_region | phase3_region | (ends)

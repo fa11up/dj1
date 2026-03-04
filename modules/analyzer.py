@@ -82,10 +82,49 @@ OUTRO_SEARCH_SEC  = 60   # scan last 60s for outro start
 
 # Energy profile: number of time segments to sample across the track
 ENERGY_SEGMENTS = 32
+SECTION_MIN_DURATION_SEC = 4.0     # discard sections shorter than this
+SECTION_ENERGY_THRESHOLD = 0.25    # below this normalised energy = "low"
+SECTION_HIGH_THRESHOLD   = 0.70    # above this = "high"
 
 # Cache version — bump this to invalidate all cached analyses
-CACHE_VERSION = "1.0"
+CACHE_VERSION = "3.0"
 
+# BPM normalisation target range — covers House (120–130), Techno (125–140),
+# DnB (160–175), Jungle, and most electronic music at native tempo.
+BPM_NORM_LO = 80.0
+BPM_NORM_HI = 175.0
+
+def normalise_bpm(bpm, lo=BPM_NORM_LO, hi=BPM_NORM_HI):
+    """
+    Correct half-time / double-time BPM detection errors.
+
+    librosa sometimes reports BPM at half or double the true tempo:
+      - 156 BPM DnB track detected as 78  → should double to 156
+      - 128 BPM House track detected as 256 → should halve to 128
+
+    Strategy: if BPM falls outside the target range (80–175), repeatedly
+    halve or double until it lands inside.
+
+    Returns (normalised_bpm, was_corrected: bool).
+    """
+    if bpm is None or bpm <= 0:
+        return bpm, False
+    original = bpm
+    # Double up if too slow
+    attempts = 0
+    while bpm < lo and attempts < 4:
+        bpm *= 2
+        attempts += 1
+    # Halve if too fast
+    attempts = 0
+    while bpm > hi and attempts < 4:
+        bpm /= 2
+        attempts += 1
+    # Final sanity — if still outside range, return original unchanged
+    if not (lo <= bpm <= hi):
+        return original, False
+    corrected = abs(bpm - original) > 0.5
+    return round(bpm, 2), corrected
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -110,22 +149,46 @@ def camelot(key_index: int, is_major: bool) -> str:
     return CAMELOT_MINOR.get(key_index, "?")
 
 
-def detect_intro_outro(y: np.ndarray, sr: int, duration: float) -> tuple[float, float]:
+def detect_intro_outro(y, sr, duration, sections=None):
     """
     Estimate where the musical content starts (intro_end) and where it begins
-    to wind down (outro_start) using RMS energy thresholding.
+    to wind down (outro_start).
+
+    If structural sections are available (P2-6), uses them for more precise
+    detection. Falls back to the original RMS energy thresholding otherwise.
 
     Returns (intro_end_sec, outro_start_sec).
-    These are the recommended DJ cue-in and cue-out points.
     """
+    intro_end   = 0.0
+    outro_start = duration
+
+    # ── Try sections-based detection first ────────────────────────────────────
+    if sections:
+        # Find the end of the last "intro" section
+        intro_sections = [s for s in sections if s["label"] == "intro"]
+        if intro_sections:
+            intro_end = intro_sections[-1]["end_sec"]
+
+        # Find the start of the first "outro" section
+        outro_sections = [s for s in sections if s["label"] == "outro"]
+        if outro_sections:
+            outro_start = outro_sections[0]["start_sec"]
+
+        # If we got useful values from sections, use them
+        if intro_end > 0 or outro_start < duration:
+            intro_end   = max(0.0, min(intro_end, duration * 0.4))
+            outro_start = max(duration * 0.5, min(outro_start, duration))
+            if intro_end < outro_start:
+                return round(intro_end, 2), round(outro_start, 2)
+
+    # ── Fallback: original RMS energy thresholding ────────────────────────────
     hop_length = 512
     rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
     times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
 
-    # Threshold: 15% of peak RMS — below this is considered silence/very quiet
     threshold = np.max(rms) * 0.15
 
-    # ── Intro: find where energy first crosses the threshold ──────────────────
+    # Intro
     intro_end = 0.0
     search_end = min(INTRO_SEARCH_SEC, duration * 0.4)
     intro_frames = times <= search_end
@@ -136,7 +199,7 @@ def detect_intro_outro(y: np.ndarray, sr: int, duration: float) -> tuple[float, 
         if len(above) > 0:
             intro_end = float(intro_times[above[0]])
 
-    # ── Outro: find where energy last drops below threshold ───────────────────
+    # Outro
     outro_start = duration
     search_start = max(0, duration - OUTRO_SEARCH_SEC)
     outro_frames = times >= search_start
@@ -147,11 +210,171 @@ def detect_intro_outro(y: np.ndarray, sr: int, duration: float) -> tuple[float, 
         if len(above) > 0:
             outro_start = float(outro_times[above[-1]])
 
-    # Sanity clamp: intro must be before outro, both within track bounds
     intro_end   = max(0.0, min(intro_end, duration * 0.4))
     outro_start = max(duration * 0.5, min(outro_start, duration))
 
     return round(intro_end, 2), round(outro_start, 2)
+
+
+def detect_sections(y, sr, beat_times, energy_curve, duration):
+    """
+    Detect structural sections of a track (intro, verse, chorus, breakdown, outro)
+    using a combination of spectral clustering and energy analysis.
+
+    Uses librosa's spectral features to find segment boundaries via self-similarity,
+    then labels each segment based on its energy characteristics relative to the
+    track's overall energy profile.
+
+    Labelling heuristic:
+      - First section with low energy → "intro"
+      - Last section with low energy  → "outro"
+      - Sections with high energy     → "chorus" (or "drop" if very high)
+      - Sections with medium energy   → "verse"
+      - Sections with energy dip surrounded by high sections → "breakdown"
+
+    Args:
+        y:            audio signal (mono, float)
+        sr:           sample rate
+        beat_times:   list of beat timestamps in seconds
+        energy_curve: normalised energy curve (32 segments, 0–1)
+        duration:     total track duration in seconds
+
+    Returns:
+        list of section dicts: [{label, start_sec, end_sec, energy, energy_category}]
+        Returns empty list on failure.
+    """
+    try:
+        # ── Compute features for segmentation ─────────────────────────────────
+        # Use MFCCs — they capture timbral changes well for structural boundaries
+        hop_length = 512
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
+
+        # Self-similarity via recurrence matrix
+        # Stack delta-MFCCs for richer features
+        mfcc_delta = librosa.feature.delta(mfcc)
+        features = np.vstack([mfcc, mfcc_delta])
+
+        # Detect segment boundaries using spectral clustering on the
+        # self-similarity matrix (novelty-based segmentation)
+        bounds = librosa.segment.agglomerative(features, k=None)
+        bound_times = librosa.frames_to_time(bounds, sr=sr, hop_length=hop_length)
+
+        # Add track start and end
+        bound_times = np.concatenate([[0.0], bound_times, [duration]])
+        bound_times = np.unique(np.sort(bound_times))
+
+        # ── Build raw sections ────────────────────────────────────────────────
+        raw_sections = []
+        for i in range(len(bound_times) - 1):
+            start = float(bound_times[i])
+            end   = float(bound_times[i + 1])
+            if (end - start) < SECTION_MIN_DURATION_SEC:
+                continue  # skip tiny sections
+
+            # Compute energy for this section from the energy curve
+            if energy_curve and len(energy_curve) > 0:
+                n_segs = len(energy_curve)
+                start_idx = int(start / duration * n_segs)
+                end_idx   = int(end / duration * n_segs)
+                start_idx = max(0, min(start_idx, n_segs - 1))
+                end_idx   = max(start_idx + 1, min(end_idx, n_segs))
+                section_energy = float(np.mean(energy_curve[start_idx:end_idx]))
+            else:
+                # Compute directly from audio
+                start_sample = int(start * sr)
+                end_sample   = min(int(end * sr), len(y))
+                if end_sample > start_sample:
+                    section_audio = y[start_sample:end_sample]
+                    rms = librosa.feature.rms(y=section_audio, hop_length=hop_length)[0]
+                    section_energy = float(np.mean(rms)) if len(rms) > 0 else 0.0
+                    # Normalise roughly to 0–1
+                    peak_rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+                    peak = float(np.max(peak_rms)) if len(peak_rms) > 0 else 1.0
+                    section_energy = section_energy / peak if peak > 0 else 0.0
+                else:
+                    section_energy = 0.0
+
+            raw_sections.append({
+                "start_sec": round(start, 2),
+                "end_sec":   round(end, 2),
+                "energy":    round(section_energy, 4),
+            })
+
+        if not raw_sections:
+            return []
+
+        # ── Merge very short adjacent sections with similar energy ────────────
+        merged = [raw_sections[0]]
+        for sec in raw_sections[1:]:
+            prev = merged[-1]
+            energy_diff = abs(prev["energy"] - sec["energy"])
+            combined_dur = sec["end_sec"] - prev["start_sec"]
+            # Merge if very similar energy and combined duration is reasonable
+            if energy_diff < 0.15 and combined_dur < duration * 0.4:
+                merged[-1] = {
+                    "start_sec": prev["start_sec"],
+                    "end_sec":   sec["end_sec"],
+                    "energy":    round((prev["energy"] + sec["energy"]) / 2, 4),
+                }
+            else:
+                merged.append(sec)
+
+        # ── Label sections ────────────────────────────────────────────────────
+        sections = []
+        n = len(merged)
+        for i, sec in enumerate(merged):
+            e = sec["energy"]
+
+            # Categorise energy level
+            if e < SECTION_ENERGY_THRESHOLD:
+                energy_cat = "low"
+            elif e > SECTION_HIGH_THRESHOLD:
+                energy_cat = "high"
+            else:
+                energy_cat = "mid"
+
+            # Positional + energy-based labelling
+            is_first = (i == 0)
+            is_last  = (i == n - 1)
+            is_early = (i <= 1)
+            is_late  = (i >= n - 2)
+
+            # Check for breakdown: low energy surrounded by higher sections
+            prev_energy = merged[i - 1]["energy"] if i > 0 else 0.0
+            next_energy = merged[i + 1]["energy"] if i < n - 1 else 0.0
+            is_dip = (e < prev_energy * 0.6 and e < next_energy * 0.6
+                      and prev_energy > SECTION_ENERGY_THRESHOLD)
+
+            if is_first and energy_cat == "low":
+                label = "intro"
+            elif is_last and energy_cat == "low":
+                label = "outro"
+            elif is_early and energy_cat == "low":
+                label = "intro"
+            elif is_late and energy_cat == "low":
+                label = "outro"
+            elif is_dip:
+                label = "breakdown"
+            elif energy_cat == "high":
+                label = "chorus"
+            elif energy_cat == "mid":
+                label = "verse"
+            else:
+                label = "bridge"
+
+            sections.append({
+                "label":           label,
+                "start_sec":       sec["start_sec"],
+                "end_sec":         sec["end_sec"],
+                "energy":          sec["energy"],
+                "energy_category": energy_cat,
+            })
+
+        return sections
+
+    except Exception:
+        # Segmentation failed — return empty (non-fatal)
+        return []
 
 
 def energy_profile(y: np.ndarray, sr: int, n_segments: int = ENERGY_SEGMENTS) -> dict:
@@ -248,19 +471,23 @@ def analyze_track(track: dict, cache_dir: Path) -> dict:
         "cache_hit":      False,
         "analysis_error": None,
         # Features
-        "bpm":            None,
-        "bpm_confidence": None,
-        "beat_times":     None,
-        "beat_count":     None,
-        "key_index":      None,
-        "key_name":       None,
-        "mode":           None,       # "major" | "minor"
-        "camelot":        None,
-        "energy":         None,       # full energy profile dict
-        "intro_end_sec":  None,
-        "outro_start_sec": None,
+        "bpm":                 None,
+        "bpm_raw":             None,
+        "bpm_normalised":      None,
+        "bpm_was_corrected":   None,
+        "bpm_confidence":      None,
+        "beat_times":          None,
+        "beat_count":          None,
+        "key_index":           None,
+        "key_name":            None,
+        "mode":                None,       # "major" | "minor"
+        "camelot":             None,
+        "energy":              None,       # full energy profile dict
+        "intro_end_sec":       None,
+        "outro_start_sec":      None,
         "spectral_centroid_mean": None,
-        "danceability":   None,
+        "danceability":        None,
+        "sections": None
     }
 
     # ── File existence check (before cache key — file_hash calls stat()) ────────
@@ -341,9 +568,6 @@ def analyze_track(track: dict, cache_dir: Path) -> dict:
         # ── Energy profile ────────────────────────────────────────────────────
         eng = energy_profile(y, sr)
 
-        # ── Intro / outro detection ───────────────────────────────────────────
-        intro_end, outro_start = detect_intro_outro(y, sr, duration)
-
         # ── Spectral centroid ─────────────────────────────────────────────────
         sc = librosa.feature.spectral_centroid(y=y, sr=sr)
         spectral_centroid_mean = round(float(np.mean(sc)), 2)
@@ -351,10 +575,26 @@ def analyze_track(track: dict, cache_dir: Path) -> dict:
         # ── Danceability ──────────────────────────────────────────────────────
         dance = danceability_score(bpm, beat_times, eng["mean"], eng["dynamic_range"])
 
+        bpm_raw = bpm
+        bpm, bpm_was_corrected = normalise_bpm(bpm)
+
+        # ── Structural sections (P2-6) ──────────────────────────────────────
+        sections = detect_sections(
+            y, sr, beat_times,
+            eng.get("curve") or eng.get("curve", []),
+            duration,
+        )
+
+         # ── Intro / outro detection ───────────────────────────────────────────
+        intro_end, outro_start = detect_intro_outro(y, sr, duration, sections)
+
         # ── Assemble result ───────────────────────────────────────────────────
         result.update({
             "analyzed_at":             datetime.now().isoformat(),
             "bpm":                     bpm,
+            "bpm_raw":                 bpm_raw,
+            "bpm_normalised":          bpm,
+            "bpm_was_corrected":       bpm_was_corrected,
             "bpm_confidence":          bpm_confidence,
             "beat_times":              beat_times,
             "beat_count":              len(beat_times),
@@ -367,6 +607,7 @@ def analyze_track(track: dict, cache_dir: Path) -> dict:
             "outro_start_sec":         outro_start,
             "spectral_centroid_mean":  spectral_centroid_mean,
             "danceability":            dance,
+            "sections":                sections,
         })
 
     except Exception as e:

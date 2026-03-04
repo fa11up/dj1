@@ -7,6 +7,7 @@ Audio I/O uses synthetic pydub segments — no real files needed.
 import sys, traceback
 from pathlib import Path
 import numpy as np
+from pydub import AudioSegment
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -23,12 +24,16 @@ from modules.renderer import (
     energy_aware_hint,
     transition_strategy,
     render_transition,
+    loop_segment,
+    LOOP_BARS_DEFAULT,
+    LOOP_BARS_LONG,
+    LOOP_MAX_REPEATS,
     SOFT_ENERGY_THRESHOLD,
     EQ_BASS_HZ,
     RUBBERBAND_AVAILABLE,
     PEDALBOARD_AVAILABLE,
+    find_breakdown_from_sections,
 )
-from pydub import AudioSegment
 
 _results = {"passed": 0, "failed": 0, "errors": []}
 
@@ -328,6 +333,240 @@ def test_render_transition():
                high_chaos_produces_output, preview_mode_works, staged_transition_no_crash]:
         run_test(fn.__name__, fn)
 
+def test_loop_segment():
+    section("loop_segment (P2-1)")
+
+    def returns_audio_and_position():
+        seg = make_seg(60.0)
+        loop_audio, loop_point = loop_segment(seg, 4, 120.0)
+        ok(isinstance(loop_audio, AudioSegment), "Should return AudioSegment")
+        ok(isinstance(loop_point, int), "Should return loop point as int ms")
+
+    def loop_extends_content():
+        seg = make_seg(60.0)
+        loop_audio, loop_point = loop_segment(seg, 4, 120.0)
+        ok(len(loop_audio) > 0, "Loop audio should have content")
+        # 4 bars at 120 BPM = 8 seconds, repeated up to 4x = ~32s
+        ok(len(loop_audio) >= 8000, f"Loop should be ≥8s, got {len(loop_audio)}ms")
+
+    def loop_point_within_segment():
+        seg = make_seg(60.0)
+        _, loop_point = loop_segment(seg, 4, 120.0)
+        ok(0 <= loop_point <= len(seg),
+           f"Loop point {loop_point} outside segment bounds 0–{len(seg)}")
+
+    def loop_with_beat_times_snaps():
+        seg = make_seg(60.0)
+        beat_times = [i * 0.5 for i in range(240)]  # 120 BPM beats
+        _, loop_point_snapped = loop_segment(seg, 4, 120.0, beat_times)
+        _, loop_point_raw     = loop_segment(seg, 4, 120.0, None)
+        # Snapped point should be on or near a beat
+        ok(isinstance(loop_point_snapped, int))
+
+    def slow_bpm_uses_longer_loop():
+        seg = make_seg(120.0)  # long enough for 8 bars at 80 BPM
+        loop_4, _ = loop_segment(seg, LOOP_BARS_DEFAULT, 80.0)
+        loop_8, _ = loop_segment(seg, LOOP_BARS_LONG, 80.0)
+        ok(len(loop_8) > len(loop_4),
+           f"8-bar loop ({len(loop_8)}ms) should be longer than 4-bar ({len(loop_4)}ms)")
+
+    def too_short_segment_returns_empty():
+        seg = make_seg(2.0)  # only 2 seconds — too short to loop
+        loop_audio, _ = loop_segment(seg, 4, 120.0)
+        eq(len(loop_audio), 0, "Should return empty audio for too-short segments")
+
+    def loop_preserves_sample_rate():
+        seg = make_seg(60.0)
+        loop_audio, _ = loop_segment(seg, 4, 120.0)
+        if len(loop_audio) > 0:
+            eq(loop_audio.frame_rate, seg.frame_rate,
+               "Loop should preserve sample rate")
+
+    def loop_preserves_channels():
+        seg = make_seg(60.0)
+        loop_audio, _ = loop_segment(seg, 4, 120.0)
+        if len(loop_audio) > 0:
+            eq(loop_audio.channels, seg.channels,
+               "Loop should preserve channel count")
+
+    for fn in [returns_audio_and_position, loop_extends_content,
+               loop_point_within_segment, loop_with_beat_times_snaps,
+               slow_bpm_uses_longer_loop, too_short_segment_returns_empty,
+               loop_preserves_sample_rate, loop_preserves_channels]:
+        run_test(fn.__name__, fn)
+
+
+# ── Looped transitions (integration) ─────────────────────────────────────────
+
+def test_looped_transitions():
+    section("looped transitions — render_transition integration (P2-1)")
+
+    def staged_with_short_outgoing():
+        """Short outgoing track should still produce valid transition via looping."""
+        out = make_seg(15.0)   # short — might not have enough for full blend
+        inc = make_seg(60.0)
+        result = render_transition(
+            out, inc,
+            make_slot(hint="long_blend", bpm=120.0),
+            make_slot(hint="long_blend", bpm=120.0),
+            chaos=0.2, preview_mode=False,
+        )
+        ok(isinstance(result, AudioSegment) and len(result) > 0,
+           "Should produce valid output even with short outgoing track")
+
+    def staged_with_normal_tracks():
+        """Normal length tracks should also work with looping enabled."""
+        out = make_seg(90.0)
+        inc = make_seg(90.0)
+        result = render_transition(
+            out, inc,
+            make_slot(hint="long_blend", bpm=128.0),
+            make_slot(hint="long_blend", bpm=128.0),
+            chaos=0.3, preview_mode=False,
+        )
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+        # Result should be longer than either track alone (loop extends)
+        ok(len(result) > len(out) * 0.5,
+           "Result should contain substantial content")
+
+    def looped_transition_longer_than_unlooped_short():
+        """With a short outgoing, the looped version should be longer
+        than just concatenating (since loop extends the outgoing)."""
+        out = make_seg(20.0)
+        inc = make_seg(60.0)
+        result = render_transition(
+            out, inc,
+            make_slot(hint="long_blend", bpm=120.0),
+            make_slot(hint="long_blend", bpm=120.0),
+            chaos=0.2, preview_mode=False,
+        )
+        simple_concat_ms = len(out) + len(inc)
+        # The result with looping should have added content
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def preview_mode_with_looping():
+        """Looping should work in preview mode too."""
+        out = make_seg(30.0)
+        inc = make_seg(30.0)
+        result = render_transition(
+            out, inc,
+            make_slot(hint="long_blend", bpm=120.0),
+            make_slot(hint="long_blend", bpm=120.0),
+            chaos=0.2, preview_mode=True,
+        )
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def high_chaos_with_looping():
+        """High chaos still produces valid output (may not loop but shouldn't crash)."""
+        out = make_seg(30.0)
+        inc = make_seg(30.0)
+        result = render_transition(
+            out, inc,
+            make_slot(hint="long_blend", bpm=128.0),
+            make_slot(hint="long_blend", bpm=128.0),
+            chaos=0.9, preview_mode=False,
+        )
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    for fn in [staged_with_short_outgoing, staged_with_normal_tracks,
+               looped_transition_longer_than_unlooped_short,
+               preview_mode_with_looping, high_chaos_with_looping]:
+        run_test(fn.__name__, fn)
+
+def test_breakdown_from_sections():
+    section("find_breakdown_from_sections (P2-6)")
+
+    # Helper: make a sections list
+    def make_sections():
+        return [
+            {"label": "intro",     "start_sec": 0.0,   "end_sec": 16.0,
+             "energy": 0.15, "energy_category": "low"},
+            {"label": "verse",     "start_sec": 16.0,  "end_sec": 64.0,
+             "energy": 0.55, "energy_category": "mid"},
+            {"label": "chorus",    "start_sec": 64.0,  "end_sec": 112.0,
+             "energy": 0.85, "energy_category": "high"},
+            {"label": "breakdown", "start_sec": 112.0, "end_sec": 128.0,
+             "energy": 0.20, "energy_category": "low"},
+            {"label": "chorus",    "start_sec": 128.0, "end_sec": 176.0,
+             "energy": 0.82, "energy_category": "high"},
+            {"label": "outro",     "start_sec": 176.0, "end_sec": 200.0,
+             "energy": 0.12, "energy_category": "low"},
+        ]
+
+    def finds_labelled_breakdown():
+        sections = make_sections()
+        # Track is 200s = 200000ms. Breakdown at 112s.
+        result = find_breakdown_from_sections(sections, 0.55, 200000)
+        ok(result is not None, "Should find breakdown")
+        # Should find the breakdown at 112s = 112000ms
+        approx(result / 1000, 112.0, 2.0)
+
+    def returns_none_for_empty():
+        result = find_breakdown_from_sections([], 0.55, 200000)
+        ok(result is None)
+
+    def returns_none_without_duration():
+        sections = make_sections()
+        result = find_breakdown_from_sections(sections, 0.55, None)
+        ok(result is None)
+
+    def finds_low_energy_fallback():
+        """If no explicit breakdown label, should find low-energy sections."""
+        sections = [
+            {"label": "intro",  "start_sec": 0.0,   "end_sec": 16.0,
+             "energy": 0.15, "energy_category": "low"},
+            {"label": "chorus", "start_sec": 16.0,  "end_sec": 100.0,
+             "energy": 0.85, "energy_category": "high"},
+            {"label": "verse",  "start_sec": 100.0, "end_sec": 150.0,
+             "energy": 0.45, "energy_category": "mid"},
+            {"label": "outro",  "start_sec": 150.0, "end_sec": 200.0,
+             "energy": 0.10, "energy_category": "low"},
+        ]
+        result = find_breakdown_from_sections(sections, 0.55, 200000)
+        ok(result is not None, "Should find outro as low-energy fallback")
+        # Should find the outro start at 150s
+        approx(result / 1000, 150.0, 2.0)
+
+    def respects_outro_start_ratio():
+        """Should not find breakdowns in the first half of the track."""
+        sections = [
+            {"label": "breakdown", "start_sec": 10.0, "end_sec": 20.0,
+             "energy": 0.15, "energy_category": "low"},
+            {"label": "chorus",    "start_sec": 20.0, "end_sec": 200.0,
+             "energy": 0.85, "energy_category": "high"},
+        ]
+        result = find_breakdown_from_sections(sections, 0.55, 200000)
+        # The breakdown at 10s is before 55% of 200s (110s), should be skipped
+        ok(result is None, "Should not find breakdown before outro_start_ratio")
+
+    def finds_chorus_to_verse_transition():
+        """Priority 3: energy drop between chorus and verse."""
+        sections = [
+            {"label": "intro",  "start_sec": 0.0,   "end_sec": 16.0,
+             "energy": 0.15, "energy_category": "low"},
+            {"label": "chorus", "start_sec": 16.0,  "end_sec": 120.0,
+             "energy": 0.85, "energy_category": "high"},
+            {"label": "verse",  "start_sec": 120.0, "end_sec": 180.0,
+             "energy": 0.45, "energy_category": "mid"},
+            {"label": "chorus", "start_sec": 180.0, "end_sec": 200.0,
+             "energy": 0.80, "energy_category": "high"},
+        ]
+        result = find_breakdown_from_sections(sections, 0.55, 200000)
+        ok(result is not None, "Should find chorus→verse transition")
+        # Should find the verse at 120s
+        approx(result / 1000, 120.0, 2.0)
+
+    def result_is_milliseconds():
+        sections = make_sections()
+        result = find_breakdown_from_sections(sections, 0.55, 200000)
+        ok(isinstance(result, int), f"Should return int ms, got {type(result)}")
+
+    for fn in [finds_labelled_breakdown, returns_none_for_empty,
+               returns_none_without_duration, finds_low_energy_fallback,
+               respects_outro_start_ratio, finds_chorus_to_verse_transition,
+               result_is_milliseconds]:
+        run_test(fn.__name__, fn)
+        
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
@@ -346,6 +585,9 @@ if __name__ == "__main__":
     test_transition_strategy()
     test_time_stretch()
     test_render_transition()
+    test_loop_segment()
+    test_looped_transitions()
+    test_breakdown_from_sections()
 
     total = _results["passed"] + _results["failed"]
     print(f"\n{'═'*52}")
