@@ -84,6 +84,12 @@ uv run python main.py --config config/session.yaml
 # Run Module 1 only (library scan)
 uv run python -m modules.ingestor --music-dir {path to music library}
 
+# Run Module 2 only (audio analysis) - use 4 jobs for parallelism
+uv run python -m modules.analyzer --tracks data/tracks.json --jobs 4
+
+# Run Module 3 only (Spotify bridge)
+uv run python -m modules.spotify_bridge --playlist {spotify playlist ID} 
+
 # Run tests
 uv run python -m pytest tests/ -v
 ```
