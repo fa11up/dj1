@@ -63,16 +63,246 @@ except Exception:
 SAMPLE_RATE     = 44100
 CHANNELS        = 2
 
-# Crossfade durations by transition hint (milliseconds)
-FADE_DURATIONS = {
-    "hard_cut":   0,
-    "quick_fade": 4_000,
-    "crossfade":  10_000,
-    "long_blend": 24_000,
-}
+# EQ band crossover frequencies (Hz)
+# Bass: 0–200Hz  |  Mids: 200–800Hz  |  Highs: 800Hz+
+EQ_BASS_HZ   = 200.0
+EQ_MID_HZ    = 800.0
 
-# EQ crossover frequency (Hz) — bass cut on outgoing, bring in on incoming
-EQ_CROSSOVER_HZ = 200.0
+# Energy threshold — below this RMS we consider a region "soft"
+SOFT_ENERGY_THRESHOLD = 0.03
+
+# Transition phase lengths in bars (at tempo)
+# Phase 2 (highs only): BPM-adaptive — 8 bars at fast tempo, 16 at slow
+# Phase 3 (bass swap):  chaos-driven — 2 bars low chaos, 4 bars high chaos
+# Phase 4 (outro):      same as phase 2
+PHASE_HIGHS_BARS_FAST = 8    # BPM >= 120
+PHASE_HIGHS_BARS_SLOW = 16   # BPM <  120
+PHASE_SWAP_BARS_TIGHT = 2    # chaos < 0.5
+PHASE_SWAP_BARS_LOOSE = 4    # chaos >= 0.5
+PHASE_OUTRO_BARS      = 16   # outgoing fades after bass swap
+
+# quick_fade and crossfade simple durations (ms) — no staging
+QUICK_FADE_MS  = 4_000
+CROSSFADE_MS   = 12_000
+
+# Minimum tail on a hard_cut so there's never dead silence
+HARD_CUT_TAIL_MS = 2_000
+
+# Phrase boundary: 8 bars × 4 beats = 32 beats
+PHRASE_BEATS = 32
+
+
+# ── Transition helpers ───────────────────────────────────────────────────────
+
+def bpm_blend_ms(bpm, preview_mode=False):
+    """
+    Compute long_blend total duration from BPM (phases 2+3+4 combined).
+    Returns milliseconds. Preview mode halves phase lengths.
+    """
+    if not bpm or bpm <= 0:
+        bpm = 120.0
+    sec_per_bar   = 4 * 60.0 / bpm
+    highs_bars    = PHASE_HIGHS_BARS_FAST if bpm >= 120 else PHASE_HIGHS_BARS_SLOW
+    outro_bars    = PHASE_OUTRO_BARS
+    swap_bars     = PHASE_SWAP_BARS_TIGHT  # default; overridden at render time
+    total_bars    = highs_bars + swap_bars + outro_bars
+    if preview_mode:
+        total_bars = max(8, total_bars // 2)
+    return int(total_bars * sec_per_bar * 1000)
+
+
+def bars_to_ms(bars, bpm):
+    """Convert a bar count to milliseconds at the given BPM."""
+    if not bpm or bpm <= 0:
+        bpm = 120.0
+    return int(bars * 4 * 60.0 / bpm * 1000)
+
+
+def find_phrase_boundary(beat_times_sec, target_ms, phrase_beats=PHRASE_BEATS):
+    """
+    Find the next clean phrase boundary (every phrase_beats beats) at or
+    after target_ms. Falls back to nearest beat if no phrase boundary found
+    within a reasonable window (8 bars).
+    Returns boundary position in ms.
+    """
+    if not beat_times_sec:
+        return target_ms
+
+    target_sec = target_ms / 1000.0
+    beats      = [b for b in beat_times_sec if b >= target_sec]
+
+    if not beats:
+        return target_ms
+
+    # Find beats that align to phrase boundaries (every phrase_beats beats)
+    all_beats   = beat_times_sec
+    phrase_boundaries = [
+        all_beats[i] for i in range(0, len(all_beats), phrase_beats)
+        if all_beats[i] >= target_sec
+    ]
+
+    if phrase_boundaries:
+        # Take the next phrase boundary after target
+        return int(phrase_boundaries[0] * 1000)
+
+    # No phrase boundary found — snap to nearest beat
+    arr = [b for b in beat_times_sec if b >= target_sec]
+    return int(arr[0] * 1000) if arr else target_ms
+
+
+def find_breakdown_point(energy_curve, outro_start_ratio=0.6):
+    """
+    Scan the track's energy curve (list of 0-1 floats, 32 segments from Module 2)
+    for the lowest energy point in the latter portion of the track
+    (after outro_start_ratio through the track).
+
+    This finds breakdowns, drops, or quiet moments near the outro — ideal
+    transition start points. Returns the segment index of the best point,
+    or None if no energy curve is available.
+    """
+    if not energy_curve or len(energy_curve) < 4:
+        return None
+    n          = len(energy_curve)
+    start_idx  = int(n * outro_start_ratio)
+    window     = energy_curve[start_idx:]
+    if not window:
+        return None
+    min_val    = min(window)
+    min_idx    = start_idx + window.index(min_val)
+    return min_idx
+
+
+def segment_idx_to_ms(seg_idx, total_ms, n_segments=32):
+    """Convert a Module 2 energy segment index to a millisecond position."""
+    return int(seg_idx / n_segments * total_ms)
+
+
+def compute_crossover_hz(spectral_centroid_mean):
+    """
+    Derive the bass/mid EQ crossover frequency from the track's spectral centroid.
+
+    Spectral centroid is the "brightness" centre of the spectrum.
+    Typical values:
+      Techno/DnB  → low centroid (dark, bass-heavy) → lower crossover (~80Hz)
+      House       → mid centroid → medium crossover (~120Hz)
+      Bright/HiNRG → high centroid → higher crossover (~180Hz)
+
+    We scale linearly: centroid 500Hz → 60Hz crossover
+                       centroid 4000Hz → 200Hz crossover
+    Clamped to 60–250Hz.
+    """
+    if not spectral_centroid_mean or spectral_centroid_mean <= 0:
+        return EQ_BASS_HZ  # fallback
+
+    # Linear interpolation: map centroid 500–4000 → crossover 60–200
+    lo_c, hi_c = 500.0,  4000.0
+    lo_x, hi_x = 60.0,   200.0
+    ratio = (spectral_centroid_mean - lo_c) / (hi_c - lo_c)
+    ratio = max(0.0, min(1.0, ratio))
+    return round(lo_x + ratio * (hi_x - lo_x), 1)
+
+
+def apply_highpass_adaptive(seg, cutoff_hz, chaos):
+    """
+    Apply a highpass filter with shape adapted to chaos level.
+    Low chaos  → hard filter (steep, decisive — Linkwitz-Riley style via cascaded biquads)
+    High chaos → gentle shelf (gradual rolloff — sounds more natural/blended)
+
+    Pedalboard doesn't expose filter order directly, so we simulate:
+      hard   = cascade two HighpassFilters at same cutoff (steeper rolloff)
+      shelf  = single HighpassFilter at lower cutoff (softer knee)
+    """
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        audio = seg_to_float(seg)
+        if chaos < 0.4:
+            # Hard: cascade two filters for steep rolloff
+            board = Pedalboard([
+                HighpassFilter(cutoff_frequency_hz=cutoff_hz),
+                HighpassFilter(cutoff_frequency_hz=cutoff_hz),
+            ])
+        else:
+            # Shelf: single filter at 60% of cutoff for gentle knee
+            board = Pedalboard([
+                HighpassFilter(cutoff_frequency_hz=cutoff_hz * 0.6),
+            ])
+        return float_to_seg(board(audio, SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
+
+
+def apply_lowpass_adaptive(seg, cutoff_hz, chaos):
+    """Adaptive lowpass — hard at low chaos, shelf at high chaos."""
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        audio = seg_to_float(seg)
+        if chaos < 0.4:
+            board = Pedalboard([
+                LowpassFilter(cutoff_frequency_hz=cutoff_hz),
+                LowpassFilter(cutoff_frequency_hz=cutoff_hz),
+            ])
+        else:
+            board = Pedalboard([
+                LowpassFilter(cutoff_frequency_hz=cutoff_hz * 1.4),
+            ])
+        return float_to_seg(board(audio, SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
+
+
+def measure_tail_energy(seg, window_sec=3.0):
+    """
+    Measure RMS energy of the last window_sec of a segment.
+    Returns a float 0–1 (normalised to int16 range).
+    """
+    window_ms = int(window_sec * 1000)
+    tail      = seg[-min(window_ms, len(seg)):]
+    samples   = np.array(tail.get_array_of_samples(), dtype=np.float32)
+    samples  /= (2 ** (tail.sample_width * 8 - 1))
+    return float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
+
+
+def measure_head_energy(seg, window_sec=3.0):
+    """
+    Measure RMS energy of the first window_sec of a segment.
+    Returns a float 0–1 (normalised to int16 range).
+    """
+    window_ms = int(window_sec * 1000)
+    head      = seg[:min(window_ms, len(seg))]
+    samples   = np.array(head.get_array_of_samples(), dtype=np.float32)
+    samples  /= (2 ** (head.sample_width * 8 - 1))
+    return float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
+
+
+def energy_aware_hint(hint, outgoing_seg, incoming_seg):
+    """
+    Override the planner's transition hint based on actual audio energy
+    at the splice point.
+
+    Rules:
+      - Both ends soft  → long_blend (gentle overlap, no jarring cut)
+      - Outgoing soft, incoming loud → crossfade (let incoming build in)
+      - Outgoing loud, incoming soft → crossfade (ease the landing)
+      - Both loud + hint is hard_cut → keep hard_cut (intentional drop)
+      - Otherwise → keep planner hint
+    """
+    tail_energy = measure_tail_energy(outgoing_seg)
+    head_energy = measure_head_energy(incoming_seg)
+
+    tail_soft = tail_energy < SOFT_ENERGY_THRESHOLD
+    head_soft = head_energy < SOFT_ENERGY_THRESHOLD
+
+    if tail_soft and head_soft:
+        return "long_blend"
+    if tail_soft or head_soft:
+        # One side is soft — a hard cut would sound broken
+        if hint == "hard_cut":
+            return "crossfade"
+        return hint
+    # Both loud — respect the planner
+    return hint
 
 
 # ── Audio loading ─────────────────────────────────────────────────────────────
@@ -167,178 +397,310 @@ def time_stretch_segment(seg, from_bpm, to_bpm, max_stretch=0.15):
         return seg
 
 
-# ── EQ swap ───────────────────────────────────────────────────────────────────
+# ── EQ helpers ───────────────────────────────────────────────────────────────
 
-def apply_eq_swap(outgoing_seg, incoming_seg, fade_ms):
-    """
-    During the overlap window:
-      - Outgoing: gradually cut bass (low-pass → high-pass)
-      - Incoming: gradually bring in bass (high-pass → low-pass)
+def seg_to_float(s):
+    """Convert pydub AudioSegment to float32 numpy array (channels, samples)."""
+    arr = np.array(s.get_array_of_samples(), dtype=np.float32)
+    arr /= (2 ** (s.sample_width * 8 - 1))
+    if s.channels == 2:
+        return arr.reshape(-1, 2).T
+    return arr.reshape(1, -1)
 
-    Uses pedalboard for filtering. Degrades to unfiltered if unavailable.
-    Returns (outgoing_tail, incoming_head) with EQ applied.
-    """
-    if not PEDALBOARD_AVAILABLE or fade_ms <= 0:
-        return outgoing_seg, incoming_seg
 
+def float_to_seg(arr, channels):
+    """Convert float32 numpy array back to pydub AudioSegment."""
+    if channels == 2:
+        arr = arr.T.flatten()
+    else:
+        arr = arr.flatten()
+    arr = np.clip(arr, -1.0, 1.0)
+    pcm = (arr * (2 ** 15 - 1)).astype(np.int16)
+    return AudioSegment(pcm.tobytes(), frame_rate=SAMPLE_RATE,
+                        sample_width=2, channels=channels)
+
+
+def apply_highpass(seg, cutoff_hz):
+    """Apply a highpass filter to a segment (cuts bass below cutoff_hz)."""
+    if not PEDALBOARD_AVAILABLE:
+        return seg
     try:
-        def seg_to_float(s):
-            arr = np.array(s.get_array_of_samples(), dtype=np.float32)
-            arr /= (2 ** (s.sample_width * 8 - 1))
-            if s.channels == 2:
-                arr = arr.reshape(-1, 2).T  # pedalboard wants (channels, samples)
-            else:
-                arr = arr.reshape(1, -1)
-            return arr
-
-        def float_to_seg(arr, channels):
-            if channels == 2:
-                arr = arr.T.flatten()
-            else:
-                arr = arr.flatten()
-            arr = np.clip(arr, -1.0, 1.0)
-            pcm = (arr * (2 ** 15 - 1)).astype(np.int16)
-            return AudioSegment(pcm.tobytes(), frame_rate=SAMPLE_RATE,
-                                sample_width=2, channels=channels)
-
-        # Outgoing tail: cut low end (simulates bass leaving the mix)
-        out_tail  = outgoing_seg[-fade_ms:]
-        out_audio = seg_to_float(out_tail)
-        board_out = Pedalboard([LowpassFilter(cutoff_frequency_hz=EQ_CROSSOVER_HZ * 2)])
-        out_filtered = board_out(out_audio, SAMPLE_RATE)
-        out_tail_eq  = float_to_seg(out_filtered, out_tail.channels)
-
-        # Incoming head: cut low end initially (bass builds in)
-        in_head   = incoming_seg[:fade_ms]
-        in_audio  = seg_to_float(in_head)
-        board_in  = Pedalboard([HighpassFilter(cutoff_frequency_hz=EQ_CROSSOVER_HZ)])
-        in_filtered  = board_in(in_audio, SAMPLE_RATE)
-        in_head_eq   = float_to_seg(in_filtered, in_head.channels)
-
-        # Reconstruct full segments with EQ applied to transition regions
-        outgoing_eq = outgoing_seg[:-fade_ms] + out_tail_eq
-        incoming_eq = in_head_eq + incoming_seg[fade_ms:]
-
-        return outgoing_eq, incoming_eq
-
-    except Exception as e:
-        print(f"    ⚠  EQ swap failed ({e}) — skipping EQ")
-        return outgoing_seg, incoming_seg
+        board = Pedalboard([HighpassFilter(cutoff_frequency_hz=cutoff_hz)])
+        return float_to_seg(board(seg_to_float(seg), SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
 
 
-# ── Transition decider ────────────────────────────────────────────────────────
+def apply_lowpass(seg, cutoff_hz):
+    """Apply a lowpass filter to a segment (cuts highs above cutoff_hz)."""
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        board = Pedalboard([LowpassFilter(cutoff_frequency_hz=cutoff_hz)])
+        return float_to_seg(board(seg_to_float(seg), SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
 
-def decide_transition_ops(hint, chaos, preview_mode):
+
+# ── Transition strategy ──────────────────────────────────────────────────────
+
+def transition_strategy(hint, chaos, preview_mode, bpm=None):
     """
-    Given a transition hint and chaos factor, return a dict of which
-    operations to apply. At high chaos, skip expensive/precise operations.
+    Return a strategy dict describing how to execute the transition.
+
+    For long_blend:  staged 3-phase DJ transition (the real deal)
+    For crossfade:   simple overlapping volume fade with EQ at low chaos
+    For quick_fade:  short volume fade, no EQ
+    For hard_cut:    sequential tail-fade + head-fade, no overlap
 
     Returns:
         {
-          "fade_ms":    int,
-          "do_stretch": bool,
-          "do_eq":      bool,
-          "do_beat_align": bool,
+          "method":        "staged" | "crossfade" | "quick_fade" | "hard_cut"
+          "do_stretch":    bool
+          "do_phrase_align": bool
+          # staged only:
+          "highs_ms":      int   phase 2 duration
+          "swap_ms":       int   phase 3 duration
+          "outro_ms":      int   phase 4 duration
+          # simple only:
+          "fade_ms":       int
         }
     """
-    base_fade = FADE_DURATIONS.get(hint, 8_000)
+    bpm = bpm or 120.0
 
-    if preview_mode:
-        # Preview: halve fade durations, no stretching
+    do_stretch      = RUBBERBAND_AVAILABLE and not preview_mode and chaos < 0.5
+    do_phrase_align = not preview_mode and chaos < 0.7
+
+    if hint == "long_blend":
+        highs_bars = PHASE_HIGHS_BARS_FAST if bpm >= 120 else PHASE_HIGHS_BARS_SLOW
+        swap_bars  = PHASE_SWAP_BARS_TIGHT if chaos < 0.5 else PHASE_SWAP_BARS_LOOSE
+        outro_bars = PHASE_OUTRO_BARS
+        if preview_mode:
+            highs_bars = max(4, highs_bars // 2)
+            swap_bars  = 1
+            outro_bars = max(4, outro_bars // 2)
         return {
-            "fade_ms":       min(base_fade, 6_000),
-            "do_stretch":    False,
-            "do_eq":         False,
-            "do_beat_align": False,
+            "method":          "staged",
+            "do_stretch":      do_stretch,
+            "do_phrase_align": do_phrase_align,
+            "highs_ms":        bars_to_ms(highs_bars, bpm),
+            "swap_ms":         bars_to_ms(swap_bars,  bpm),
+            "outro_ms":        bars_to_ms(outro_bars, bpm),
         }
 
-    if chaos >= 0.8:
-        # Wild: hard cut or tiny fade, nothing else
+    if hint == "crossfade":
+        fade_ms = min(CROSSFADE_MS, CROSSFADE_MS // 2 if preview_mode else CROSSFADE_MS)
         return {
-            "fade_ms":       0 if hint == "hard_cut" else min(base_fade, 2_000),
-            "do_stretch":    False,
-            "do_eq":         False,
-            "do_beat_align": False,
+            "method":          "crossfade",
+            "do_stretch":      do_stretch,
+            "do_phrase_align": False,
+            "fade_ms":         fade_ms,
+            "do_eq":           PEDALBOARD_AVAILABLE and chaos < 0.5,
         }
-    elif chaos >= 0.6:
-        # Volume fade only
+
+    if hint == "quick_fade":
         return {
-            "fade_ms":       base_fade,
-            "do_stretch":    False,
-            "do_eq":         False,
-            "do_beat_align": False,
+            "method":          "quick_fade",
+            "do_stretch":      False,
+            "do_phrase_align": False,
+            "fade_ms":         QUICK_FADE_MS,
+            "do_eq":           False,
         }
-    elif chaos >= 0.3:
-        # EQ + fade, no stretch
-        return {
-            "fade_ms":       base_fade,
-            "do_stretch":    False,
-            "do_eq":         PEDALBOARD_AVAILABLE,
-            "do_beat_align": False,
-        }
-    else:
-        # Full pipeline
-        return {
-            "fade_ms":       base_fade,
-            "do_stretch":    RUBBERBAND_AVAILABLE,
-            "do_eq":         PEDALBOARD_AVAILABLE,
-            "do_beat_align": LIBROSA_AVAILABLE,
-        }
+
+    # hard_cut
+    return {
+        "method":          "hard_cut",
+        "do_stretch":      False,
+        "do_phrase_align": False,
+        "fade_ms":         HARD_CUT_TAIL_MS,
+        "do_eq":           False,
+    }
 
 
 # ── Core render ───────────────────────────────────────────────────────────────
 
+def _stretch_incoming(incoming, bpm_in, bpm_out, window_ms):
+    """Time-stretch the first window_ms + buffer of incoming to match bpm_out."""
+    if not bpm_in or not bpm_out or abs(bpm_in - bpm_out) < 1:
+        return incoming
+    buf      = 4_000
+    head     = incoming[:window_ms + buf]
+    rest     = incoming[window_ms + buf:]
+    return time_stretch_segment(head, bpm_in, bpm_out) + rest
+
+
+def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
+    """
+    Full DJ transition — 4 phases:
+
+      Phase 1  outgoing plays alone, transition held until breakdown point
+               + next phrase boundary (the "right moment")
+      Phase 2  incoming highs enter (bass cut); outgoing plays full-range
+               (crowd hears a new layer on top, bass stays locked to outgoing)
+      Phase 3  bass swap — outgoing bass cut, incoming bass brought in
+               (tight at low chaos, loose at high chaos)
+      Phase 4  incoming plays full-range; outgoing highs/mids fade out
+
+    EQ crossover derived from spectral centroid (adaptive per track).
+    Filter shape: hard (cascaded) at low chaos, shelf (gentle) at high chaos.
+    """
+    bpm        = slot_out.get("actual_bpm") or 120.0
+    beat_times = slot_out.get("beat_times") or []
+    highs_ms   = strategy["highs_ms"]
+    swap_ms    = strategy["swap_ms"]
+    outro_ms   = strategy["outro_ms"]
+    total_ms   = highs_ms + swap_ms + outro_ms
+
+    # ── Adaptive EQ crossover from spectral centroid ──────────────────────────
+    centroid   = slot_out.get("spectral_centroid_mean")
+    bass_hz    = compute_crossover_hz(centroid)
+    # Highs cutoff: 4× bass crossover, clamped to 400–1200Hz
+    highs_hz   = max(400.0, min(1200.0, bass_hz * 4))
+
+    # ── Find breakdown point — hold transition until energy dips ──────────────
+    energy_curve = (slot_out.get("energy") or {}).get("curve") or []
+    breakdown_idx = find_breakdown_point(energy_curve, outro_start_ratio=0.55)
+    if breakdown_idx is not None and beat_times:
+        breakdown_ms = segment_idx_to_ms(breakdown_idx, len(outgoing))
+        # Now find the next phrase boundary at or after the breakdown
+        phrase_ms = find_phrase_boundary(beat_times, breakdown_ms)
+        phrase_ms = min(phrase_ms, int(len(outgoing) * 0.82))
+        total_available = len(outgoing) - phrase_ms
+        if total_available >= total_ms * 0.5:
+            # Good — we have room. Redistribute if needed.
+            if total_available < total_ms:
+                scale    = total_available / total_ms
+                highs_ms = int(highs_ms * scale)
+                swap_ms  = max(int(swap_ms * scale), 500)
+                outro_ms = int(outro_ms * scale)
+                total_ms = highs_ms + swap_ms + outro_ms
+        # else: breakdown too late in track, fall through to normal phrase align
+
+    # ── Phrase align the splice point (if breakdown search didn't already) ─────
+    elif strategy["do_phrase_align"] and beat_times:
+        target_ms  = max(0, len(outgoing) - total_ms)
+        aligned_ms = find_phrase_boundary(beat_times, target_ms)
+        aligned_ms = min(aligned_ms, int(len(outgoing) * 0.80))
+        total_available = len(outgoing) - aligned_ms
+        if total_available < total_ms and total_ms > 0:
+            scale    = total_available / total_ms
+            highs_ms = int(highs_ms * scale)
+            swap_ms  = max(int(swap_ms  * scale), 500)
+            outro_ms = int(outro_ms * scale)
+            total_ms = highs_ms + swap_ms + outro_ms
+
+    # ── Clamp everything to available audio ───────────────────────────────────
+    max_out  = max(4000, len(outgoing) - 2000)
+    max_in   = max(4000, len(incoming) - 2000)
+    total_ms = min(total_ms, max_out, max_in)
+    # Ensure phases fit inside total_ms with minimum viable swap
+    swap_ms  = max(500, min(swap_ms,  total_ms // 4))
+    highs_ms = max(500, min(highs_ms, (total_ms - swap_ms) // 2))
+    outro_ms = max(500, total_ms - highs_ms - swap_ms)
+    # Re-clamp total to actual sum of phases
+    total_ms = highs_ms + swap_ms + outro_ms
+    total_ms = min(total_ms, max_out, max_in)
+    # Final phase redistribution to honour clamped total
+    phase_sum = highs_ms + swap_ms + outro_ms
+    if phase_sum > total_ms and phase_sum > 0:
+        ratio    = total_ms / phase_sum
+        highs_ms = max(500, int(highs_ms * ratio))
+        swap_ms  = max(500, int(swap_ms  * ratio))
+        outro_ms = max(500, total_ms - highs_ms - swap_ms)
+
+    # ── Time-stretch incoming to match outgoing BPM ───────────────────────────
+    if strategy["do_stretch"]:
+        bpm_in  = slot_in.get("actual_bpm")
+        bpm_out = slot_out.get("actual_bpm")
+        incoming = _stretch_incoming(incoming, bpm_in, bpm_out, total_ms)
+
+    # ── Slice regions ──────────────────────────────────────────────────────────
+    # outgoing: body | phase2_region | phase3_region | (ends)
+    p2_start = max(0, len(outgoing) - (highs_ms + swap_ms + outro_ms))
+    p3_start = p2_start + highs_ms
+    p4_start = p3_start + swap_ms
+
+    out_body  = outgoing[:p2_start]                # plays alone
+    out_p2    = outgoing[p2_start:p3_start]        # full range, incoming highs on top
+    out_p3    = outgoing[p3_start:p4_start]        # bass cut here (swap point)
+    out_p4    = outgoing[p4_start:]                # highs fade out, incoming takes over
+
+    inc_p2    = incoming[:highs_ms]                # highs only (bass cut)
+    inc_p3    = incoming[highs_ms:highs_ms+swap_ms] # bass comes in
+    inc_p4    = incoming[highs_ms+swap_ms:highs_ms+swap_ms+outro_ms]  # full range
+    inc_body  = incoming[highs_ms+swap_ms+outro_ms:]  # rest of track, unmodified
+
+    # ── Phase 2: incoming highs only over outgoing full range ─────────────────
+    # Strip bass+mids from incoming — crowd hears a shimmering layer on top
+    inc_p2_hi  = apply_highpass_adaptive(inc_p2, highs_hz, chaos)
+    overlap_p2 = out_p2.overlay(inc_p2_hi)
+
+    # ── Phase 3: bass swap — decisive, tight window ───────────────────────────
+    # Cut outgoing bass, bring in incoming bass simultaneously.
+    # Two basslines playing together = mud. This is the critical handoff.
+    out_p3_nobase = apply_highpass_adaptive(out_p3, bass_hz, chaos)
+    inc_p3_full   = inc_p3  # incoming enters full range (bass now present)
+    overlap_p3    = out_p3_nobase.overlay(inc_p3_full)
+
+    # ── Phase 4: outgoing highs fade out, incoming full range ─────────────────
+    # Outgoing highs linger briefly then dissolve — incoming fully takes over
+    out_p4_hi  = apply_highpass_adaptive(out_p4, highs_hz, chaos).fade_out(outro_ms)
+    overlap_p4 = inc_p4.overlay(out_p4_hi)
+
+    return out_body + overlap_p2 + overlap_p3 + overlap_p4 + inc_body
+
+
 def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode):
     """
-    Blend outgoing → incoming segment based on transition ops.
-
-    outgoing / incoming : pydub AudioSegments (already trimmed to cues)
-    slot_out / slot_in  : session slot dicts (for BPM, beat_times, hint)
-
-    Returns the combined segment including the overlap blend.
+    Entry point for all transitions.
+    Determines strategy via energy + hint + chaos, dispatches to the
+    appropriate render function.
     """
-    hint = slot_in.get("transition_hint", "crossfade")
-    ops  = decide_transition_ops(hint, chaos, preview_mode)
-    fade_ms = ops["fade_ms"]
+    hint     = slot_in.get("transition_hint", "crossfade")
+    hint     = energy_aware_hint(hint, outgoing, incoming)
+    bpm      = slot_out.get("actual_bpm") or slot_in.get("actual_bpm")
+    strategy = transition_strategy(hint, chaos, preview_mode, bpm=bpm)
+    method   = strategy["method"]
 
-    # ── Beat alignment ────────────────────────────────────────────────────────
-    if ops["do_beat_align"]:
-        beat_times = slot_out.get("beat_times") or []
-        if beat_times and fade_ms > 0:
-            # Snap the splice point to the nearest beat before the outro
-            splice_target_ms = len(outgoing) - fade_ms
-            aligned_ms       = nearest_beat_ms(splice_target_ms, beat_times)
-            # Only adjust if within 500ms of original splice point
-            if abs(aligned_ms - splice_target_ms) < 500:
-                fade_ms = len(outgoing) - aligned_ms
+    # ── Staged DJ transition ──────────────────────────────────────────────────
+    if method == "staged":
+        return render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=chaos)
 
+    # ── Simple crossfade ──────────────────────────────────────────────────────
+    fade_ms = strategy["fade_ms"]
     fade_ms = max(0, min(fade_ms, len(outgoing) - 1000, len(incoming) - 1000))
 
-    # ── BPM time-stretch ──────────────────────────────────────────────────────
-    if ops["do_stretch"] and fade_ms > 0:
-        bpm_out = slot_out.get("actual_bpm")
-        bpm_in  = slot_in.get("actual_bpm")
-        if bpm_out and bpm_in and abs(bpm_out - bpm_in) > 1:
-            # Stretch only the incoming head (overlap region) to match outgoing
-            head     = incoming[:fade_ms + 4000]  # small buffer past fade
-            rest     = incoming[fade_ms + 4000:]
-            head_str = time_stretch_segment(head, bpm_in, bpm_out)
-            incoming = head_str + rest
-
-    # ── EQ swap ───────────────────────────────────────────────────────────────
-    if ops["do_eq"] and fade_ms > 0:
-        outgoing, incoming = apply_eq_swap(outgoing, incoming, fade_ms)
-
-    # ── Volume crossfade ──────────────────────────────────────────────────────
     if fade_ms <= 0:
         return outgoing + incoming
+
+    if method == "hard_cut":
+        # Sequential tail-fade + head-fade — breath between tracks, no overlap
+        out_body = outgoing[:-fade_ms]
+        out_tail = outgoing[-fade_ms:].fade_out(fade_ms)
+        in_head  = incoming[:fade_ms].fade_in(fade_ms)
+        in_body  = incoming[fade_ms:]
+        return out_body + out_tail + in_head + in_body
+
+    # crossfade / quick_fade — overlap the fade regions
+    if strategy.get("do_stretch"):
+        bpm_in  = slot_in.get("actual_bpm")
+        bpm_out = slot_out.get("actual_bpm")
+        incoming = _stretch_incoming(incoming, bpm_in, bpm_out, fade_ms)
+
+    if strategy.get("do_eq") and PEDALBOARD_AVAILABLE:
+        centroid     = slot_out.get("spectral_centroid_mean")
+        bass_hz      = compute_crossover_hz(centroid)
+        out_tail_raw = outgoing[-fade_ms:]
+        in_head_raw  = incoming[:fade_ms]
+        out_tail_eq  = apply_highpass_adaptive(out_tail_raw, bass_hz, chaos)
+        in_head_eq   = apply_highpass_adaptive(in_head_raw,  bass_hz, chaos)
+        outgoing  = outgoing[:-fade_ms] + out_tail_eq
+        incoming  = in_head_eq + incoming[fade_ms:]
 
     out_body = outgoing[:-fade_ms]
     out_tail = outgoing[-fade_ms:].fade_out(fade_ms)
     in_head  = incoming[:fade_ms].fade_in(fade_ms)
     in_body  = incoming[fade_ms:]
-
-    # Overlay the tails
     overlap  = out_tail.overlay(in_head)
     return out_body + overlap + in_body
 
