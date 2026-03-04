@@ -118,7 +118,7 @@ def run_module_2(paths, config):
         tracks_path=paths["tracks_json"],
         output_path=paths["analysis_json"],
         cache_dir=paths["analysis_cache"],
-        n_jobs=-1,
+        n_jobs=4,
     )
 
 

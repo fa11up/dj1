@@ -87,7 +87,7 @@ SECTION_ENERGY_THRESHOLD = 0.25    # below this normalised energy = "low"
 SECTION_HIGH_THRESHOLD   = 0.70    # above this = "high"
 
 # Cache version — bump this to invalidate all cached analyses
-CACHE_VERSION = "3.0"
+CACHE_VERSION = "4.0"
 
 # BPM normalisation target range — covers House (120–130), Techno (125–140),
 # DnB (160–175), Jungle, and most electronic music at native tempo.
@@ -629,7 +629,7 @@ def analyze_track(track: dict, cache_dir: Path) -> dict:
 def analyze_library(
     tracks: list[dict],
     cache_dir: Path,
-    n_jobs: int = -1,
+    n_jobs: int = 4,
 ) -> tuple[list[dict], dict]:
     """
     Analyze all tracks in parallel. Returns (results list, stats dict).
@@ -734,7 +734,7 @@ def run(
     tracks_path: str = "./data/tracks.json",
     output_path: str = "./data/analysis.json",
     cache_dir:   str = "./data/.analysis_cache",
-    n_jobs:      int = -1,
+    n_jobs:      int = 4,
 ) -> dict:
     """
     Main entry point for Module 2.
@@ -762,7 +762,7 @@ def run(
 
     print(f"\n  {dim('Tracks registry:')} {tracks_path}")
     print(f"  {dim('Cache directory:')} {cache_dir}")
-    print(f"  {dim('Parallel workers:')} {'all cores' if n_jobs == -1 else n_jobs}\n")
+    print(f"  {dim('Parallel workers:')} {'four cores' if n_jobs == 4 else n_jobs}\n")
 
     results, stats = analyze_library(
         tracks=tracks,
@@ -797,8 +797,8 @@ if __name__ == "__main__":
                         help="Output path for analysis.json")
     parser.add_argument("--cache",   "-c", default="./data/.analysis_cache",
                         help="Directory for cached analysis results")
-    parser.add_argument("--jobs",    "-j", type=int, default=-1,
-                        help="Parallel workers (-1 = all cores, 1 = single-threaded)")
+    parser.add_argument("--jobs",    "-j", type=int, default=4,
+                        help="Parallel workers (4 = four cores, 1 = single-threaded)")
     args = parser.parse_args()
 
     run(

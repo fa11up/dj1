@@ -16,17 +16,17 @@ spotify:
 # ── Session Shape ─────────────────────────────
 session:
   duration_minutes: 20
-  energy_curve: "peak_valley"      # flat | ramp_up | peak_valley | festival
-  mood_prompt: "late night, coding, driving"               # e.g. "late night, melancholic, driving"
+  energy_curve: "flat"      # flat | ramp_up | peak_valley | festival
+  mood_prompt: "late night, coding, melancholic"               # e.g. "late night, melancholic, driving"
 
 # ── DJ Behavior ───────────────────────────────
 dj:
-  chaos_factor: 0.7             # 0.0 = safe, 1.0 = wild
-  random_seed: 20             # Set an integer for reproducible runs
-  harmonic_strict: true
+  chaos_factor: 0.1             # 0.0 = safe, 1.0 = wild
+  random_seed: 1             # Set an integer for reproducible runs
+  harmonic_strict: false
   bpm_normalize: true
   tempo_tolerance_bpm: 8
-  transition_style: "mixed"     # blends | cuts | mixed
+  transition_style: "blends"     # blends | cuts | mixed
 
 # ── Output ────────────────────────────────────
 output:
