@@ -1,0 +1,34 @@
+# AutoDJ Session Config
+# Edit this file before each run to shape your mix
+
+# ── Paths ─────────────────────────────────────
+paths:
+  music_dir: "./music"   # Path to your local music folder
+  data_dir: "./data"            # Where pipeline JSON files are written
+  output_dir: "./output"        # Where the final mix is saved
+
+# ── Spotify Seed (optional) ───────────────────
+spotify:
+  enabled: true                # Set true once Module 3 is built
+  playlist_ids: [""]
+  match_threshold: 55
+
+# ── Session Shape ─────────────────────────────
+session:
+  duration_minutes: 20
+  energy_curve: "festival"      # flat | ramp_up | peak_valley | festival
+  mood_prompt: ""               # e.g. "late night, melancholic, driving"
+
+# ── DJ Behavior ───────────────────────────────
+dj:
+  chaos_factor: 0.2             # 0.0 = safe, 1.0 = wild
+  random_seed: 420             # Set an integer for reproducible runs
+  harmonic_strict: true
+  bpm_normalize: true
+  tempo_tolerance_bpm: 8
+  transition_style: "blends"     # blends | cuts | mixed
+
+# ── Output ────────────────────────────────────
+output:
+  format: "mp3"                 # wav | mp3
+  bitrate: "320k"
