@@ -3,21 +3,21 @@
 
 # ── Paths ─────────────────────────────────────
 paths:
-  music_dir: "~/Downloads/vibe1ondo"   # Path to your local music folder
+  music_dir: "./music"   # Path to your local music folder
   data_dir: "./data"            # Where pipeline JSON files are written
   output_dir: "./output"        # Where the final mix is saved
 
 # ── Spotify Seed (optional) ───────────────────
 spotify:
   enabled: true                # Set true once Module 3 is built
-  playlist_ids: ["5ymOSXic3iuFBhcN4VaLor"]
+  playlist_ids: [""]
   match_threshold: 55
 
 # ── Session Shape ─────────────────────────────
 session:
   duration_minutes: 20
   energy_curve: "festival"      # flat | ramp_up | peak_valley | festival
-  mood_prompt: "underground rave in Berlin"               # e.g. "late night, melancholic, driving"
+  mood_prompt: ""               # e.g. "late night, melancholic, driving"
 
 # ── DJ Behavior ───────────────────────────────
 dj:
