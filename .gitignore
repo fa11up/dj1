@@ -1,5 +1,6 @@
 .env
 data
+output
 .spotify_token_cache
 .python-version
 uv.lock

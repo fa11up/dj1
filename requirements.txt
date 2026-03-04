@@ -1,9 +1,8 @@
 # AutoDJ Engine — Python Dependencies
-# Install with: pip install -r requirements.txt
+# Install with: uv run pip install -r requirements.txt
 
 # ── Audio Analysis ─────────────────────────────
 librosa==0.10.2
-aubio==0.4.9
 soundfile==0.12.1
 numpy==1.26.4
 
@@ -24,6 +23,4 @@ thefuzz==0.22.1        # fuzzywuzzy successor (no deprecation warnings)
 python-Levenshtein==0.25.1  # speeds up thefuzz significantly
 joblib==1.4.2
 pyyaml==6.0.2
-tqdm==4.66.4
 colorama==0.4.6        # colored terminal output (cross-platform)
-rich==13.7.1           # pretty tables and progress in CLI
