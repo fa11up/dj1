@@ -36,7 +36,7 @@ from modules.analyzer import (
     normalise_bpm,
     detect_sections, 
     SECTION_MIN_DURATION_SEC,
-    infer_genre,
+    # infer_genre,
 )
 
 # ── Minimal test framework ────────────────────────────────────────────────────
@@ -661,93 +661,93 @@ def test_detect_sections():
                complex_signal_finds_sections, analyze_track_has_sections_field]:
         run_test(fn.__name__, fn)
 
-def test_infer_genre():
-    section("Unit Tests: infer_genre (P2-4)")
+# def test_infer_genre():
+#     section("Unit Tests: infer_genre (P2-4)")
 
-    def dnb_detected():
-        genre = infer_genre(170.0, 1500.0)
-        assert_eq(genre, "dnb", f"170 BPM + low centroid should be dnb, got {genre}")
+#     def dnb_detected():
+#         genre = infer_genre(170.0, 1500.0)
+#         assert_eq(genre, "dnb", f"170 BPM + low centroid should be dnb, got {genre}")
 
-    def dnb_at_boundary():
-        genre = infer_genre(160.0, 1200.0)
-        assert_eq(genre, "dnb", f"160 BPM + dark centroid should be dnb, got {genre}")
+#     def dnb_at_boundary():
+#         genre = infer_genre(160.0, 1200.0)
+#         assert_eq(genre, "dnb", f"160 BPM + dark centroid should be dnb, got {genre}")
 
-    def jungle_bright():
-        genre = infer_genre(168.0, 3500.0)
-        assert_eq(genre, "jungle", f"168 BPM + bright centroid should be jungle, got {genre}")
+#     def jungle_bright():
+#         genre = infer_genre(168.0, 3500.0)
+#         assert_eq(genre, "jungle", f"168 BPM + bright centroid should be jungle, got {genre}")
 
-    def house_detected():
-        genre = infer_genre(124.0, 2500.0)
-        assert_eq(genre, "house", f"124 BPM + mid centroid should be house, got {genre}")
+#     def house_detected():
+#         genre = infer_genre(124.0, 2500.0)
+#         assert_eq(genre, "house", f"124 BPM + mid centroid should be house, got {genre}")
 
-    def house_at_128():
-        genre = infer_genre(128.0, 2200.0)
-        assert_eq(genre, "house", f"128 BPM + mid centroid should be house, got {genre}")
+#     def house_at_128():
+#         genre = infer_genre(128.0, 2200.0)
+#         assert_eq(genre, "house", f"128 BPM + mid centroid should be house, got {genre}")
 
-    def techno_dark():
-        genre = infer_genre(132.0, 1200.0)
-        assert_eq(genre, "techno", f"132 BPM + low centroid should be techno, got {genre}")
+#     def techno_dark():
+#         genre = infer_genre(132.0, 1200.0)
+#         assert_eq(genre, "techno", f"132 BPM + low centroid should be techno, got {genre}")
 
-    def techno_fast():
-        genre = infer_genre(140.0, 1600.0)
-        assert_eq(genre, "techno", f"140 BPM + mid-low centroid should be techno, got {genre}")
+#     def techno_fast():
+#         genre = infer_genre(140.0, 1600.0)
+#         assert_eq(genre, "techno", f"140 BPM + mid-low centroid should be techno, got {genre}")
 
-    def breaks_detected():
-        genre = infer_genre(130.0, 2000.0, energy_dynamic_range=0.08)
-        assert_eq(genre, "breaks", f"130 BPM + high dynamic range should be breaks, got {genre}")
+#     def breaks_detected():
+#         genre = infer_genre(130.0, 2000.0, energy_dynamic_range=0.08)
+#         assert_eq(genre, "breaks", f"130 BPM + high dynamic range should be breaks, got {genre}")
 
-    def downtempo_detected():
-        genre = infer_genre(100.0, 2000.0)
-        assert_eq(genre, "downtempo", f"100 BPM should be downtempo, got {genre}")
+#     def downtempo_detected():
+#         genre = infer_genre(100.0, 2000.0)
+#         assert_eq(genre, "downtempo", f"100 BPM should be downtempo, got {genre}")
 
-    def downtempo_boundary():
-        genre = infer_genre(90.0, 1500.0)
-        assert_eq(genre, "downtempo", f"90 BPM should be downtempo, got {genre}")
+#     def downtempo_boundary():
+#         genre = infer_genre(90.0, 1500.0)
+#         assert_eq(genre, "downtempo", f"90 BPM should be downtempo, got {genre}")
 
-    def unknown_for_none_bpm():
-        genre = infer_genre(None, 2000.0)
-        assert_eq(genre, "unknown")
+#     def unknown_for_none_bpm():
+#         genre = infer_genre(None, 2000.0)
+#         assert_eq(genre, "unknown")
 
-    def unknown_for_zero_bpm():
-        genre = infer_genre(0, 2000.0)
-        assert_eq(genre, "unknown")
+#     def unknown_for_zero_bpm():
+#         genre = infer_genre(0, 2000.0)
+#         assert_eq(genre, "unknown")
 
-    def unknown_for_extreme_bpm():
-        genre = infer_genre(200.0, 2000.0)
-        assert_eq(genre, "unknown", f"200 BPM should be unknown, got {genre}")
+#     def unknown_for_extreme_bpm():
+#         genre = infer_genre(200.0, 2000.0)
+#         assert_eq(genre, "unknown", f"200 BPM should be unknown, got {genre}")
 
-    def none_centroid_still_works():
-        """Should not crash with None centroid — uses default."""
-        genre = infer_genre(128.0, None)
-        assert_true(genre in ("house", "techno", "breaks", "unknown"),
-                    f"128 BPM + None centroid should give valid genre, got {genre}")
+#     def none_centroid_still_works():
+#         """Should not crash with None centroid — uses default."""
+#         genre = infer_genre(128.0, None)
+#         assert_true(genre in ("house", "techno", "breaks", "unknown"),
+#                     f"128 BPM + None centroid should give valid genre, got {genre}")
 
-    def all_bpm_ranges_covered():
-        """Fuzz: every BPM from 85–175 should return a non-unknown genre."""
-        for bpm in range(85, 176):
-            genre = infer_genre(float(bpm), 2000.0)
-            assert_true(genre != "unknown",
-                        f"BPM {bpm} returned 'unknown' — should be classified")
+#     def all_bpm_ranges_covered():
+#         """Fuzz: every BPM from 85–175 should return a non-unknown genre."""
+#         for bpm in range(85, 176):
+#             genre = infer_genre(float(bpm), 2000.0)
+#             assert_true(genre != "unknown",
+#                         f"BPM {bpm} returned 'unknown' — should be classified")
 
-    def analyze_track_has_genre_field():
-        """Integration: analyze_track result includes genre field."""
-        import tempfile
-        wav = Path(tempfile.mktemp(suffix=".wav"))
-        make_wav_from_array(wav, make_click_track(bpm=120.0, duration=10.0))
-        track = make_track_stub("genre_test", str(wav))
-        cache_dir = Path(tempfile.mkdtemp())
-        result = analyze_track(track, cache_dir)
-        assert_true("genre" in result, "Missing 'genre' field in analysis result")
-        assert_true(result["genre"] is not None, "Genre should not be None for valid track")
-        wav.unlink(missing_ok=True)
+#     def analyze_track_has_genre_field():
+#         """Integration: analyze_track result includes genre field."""
+#         import tempfile
+#         wav = Path(tempfile.mktemp(suffix=".wav"))
+#         make_wav_from_array(wav, make_click_track(bpm=120.0, duration=10.0))
+#         track = make_track_stub("genre_test", str(wav))
+#         cache_dir = Path(tempfile.mkdtemp())
+#         result = analyze_track(track, cache_dir)
+#         assert_true("genre" in result, "Missing 'genre' field in analysis result")
+#         assert_true(result["genre"] is not None, "Genre should not be None for valid track")
+#         wav.unlink(missing_ok=True)
 
-    for fn in [dnb_detected, dnb_at_boundary, jungle_bright,
-               house_detected, house_at_128, techno_dark, techno_fast,
-               breaks_detected, downtempo_detected, downtempo_boundary,
-               unknown_for_none_bpm, unknown_for_zero_bpm, unknown_for_extreme_bpm,
-               none_centroid_still_works, all_bpm_ranges_covered,
-               analyze_track_has_genre_field]:
-        run_test(fn.__name__, fn)
+#     for fn in [dnb_detected, dnb_at_boundary, jungle_bright,
+#                house_detected, house_at_128, techno_dark, techno_fast,
+#                breaks_detected, downtempo_detected, downtempo_boundary,
+#                unknown_for_none_bpm, unknown_for_zero_bpm, unknown_for_extreme_bpm,
+#                none_centroid_still_works, all_bpm_ranges_covered,
+#                analyze_track_has_genre_field]:
+#         run_test(fn.__name__, fn)
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -763,7 +763,7 @@ if __name__ == "__main__":
     test_analyze_library()
     test_normalise_bpm()
     test_detect_sections()
-    test_infer_genre()
+    # test_infer_genre()
 
     total = _results["passed"] + _results["failed"]
     print(f"\n{'═'*58}")

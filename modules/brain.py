@@ -28,6 +28,9 @@ import json
 import logging
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 try:
     import anthropic
     ANTHROPIC_AVAILABLE = True

@@ -445,22 +445,11 @@ def _build_channel(
         track_id    = seg.get(channel_name)
         duration_ms = int(seg["duration_bars"] * bar_ms)
 
-        if not track_id or track_id not in prepared_stems:
-            # Silence on this channel for this segment
-            if len(channel) == 0:
-                channel = silence_fn(duration_ms)
-            else:
-                channel = channel + silence_fn(duration_ms)
-            prev_track = None
-            continue
-
-        stems   = prepared_stems[track_id]
-        stem_ch = stems.get(channel_name)
+        stems   = prepared_stems.get(track_id) if track_id else None
+        stem_ch = stems.get(channel_name) if stems else None
         if stem_ch is None:
-            if len(channel) == 0:
-                channel = silence_fn(duration_ms)
-            else:
-                channel = channel + silence_fn(duration_ms)
+            # No stem available — fill with silence
+            channel = silence_fn(duration_ms) if not len(channel) else channel + silence_fn(duration_ms)
             prev_track = None
             continue
 

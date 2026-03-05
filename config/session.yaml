@@ -15,15 +15,15 @@ spotify:
 
 # ── Session Shape ─────────────────────────────
 session:
-  mode: "sequential"        # sequential | creative
-  duration_minutes: 7
-  energy_curve: "festival"      # flat | ramp_up | peak_valley | festival
-  mood_prompt: "deep bass, underground, rave"               # e.g. "late night, melancholic, driving"
+  mode: "creative"        # sequential | creative
+  duration_minutes: 30     # total mix length in minutes
+  energy_curve: "peak_valley"      # flat | ramp_up | peak_valley | festival
+  mood_prompt: "make up something futuristic"               # e.g. "late night, melancholic, driving"
 
 # ── DJ Behavior ───────────────────────────────
 dj:
-  chaos_factor: 0.3             # 0.0 = safe, 1.0 = wild
-  random_seed: 411            # Set an integer for reproducible runs
+  chaos_factor: 1             # 0.0 = safe, 1.0 = wild
+  random_seed: 53            # Set an integer for reproducible runs
   harmonic_strict: true
   bpm_normalize: true
   tempo_tolerance_bpm: 8
@@ -42,3 +42,12 @@ brain:
 output:
   format: "mp3"                 # wav | mp3
   bitrate: "320k"
+
+# ── ID3 Tags (MP3 metadata) ───────────────────
+# Title and tracklist are auto-generated; fill in the rest.
+id3:
+  artist:   "me"
+  album:    "dj1"
+  composer: "dj1"
+  genre:    "Electronic"
+  artwork:  "~/Downloads/IMG_0483.JPG"                  # path to cover art (jpg/png)

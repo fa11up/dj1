@@ -244,24 +244,30 @@ def detect_sections(y, sr, beat_times, energy_curve, duration):
         Returns empty list on failure.
     """
     try:
-        # ── Compute features for segmentation ─────────────────────────────────
-        # Use MFCCs — they capture timbral changes well for structural boundaries
-        hop_length = 512
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
+        # ── Seed boundaries from energy curve (reliable baseline) ──────────────
+        # Detects amplitude/energy transitions that MFCC features miss when timbre
+        # is uniform. A jump of >0.25 in adjacent energy curve segments = boundary.
+        bound_times = np.array([0.0, duration])
+        if energy_curve and len(energy_curve) > 1 and duration > 0:
+            ec = np.array(energy_curve, dtype=np.float32)
+            jump_idx = np.where(np.abs(np.diff(ec)) > 0.25)[0] + 1
+            if len(jump_idx):
+                jump_times = jump_idx / len(ec) * duration
+                bound_times = np.unique(np.sort(np.concatenate([bound_times, jump_times])))
 
-        # Self-similarity via recurrence matrix
-        # Stack delta-MFCCs for richer features
-        mfcc_delta = librosa.feature.delta(mfcc)
-        features = np.vstack([mfcc, mfcc_delta])
-
-        # Detect segment boundaries using spectral clustering on the
-        # self-similarity matrix (novelty-based segmentation)
-        bounds = librosa.segment.agglomerative(features, k=None)
-        bound_times = librosa.frames_to_time(bounds, sr=sr, hop_length=hop_length)
-
-        # Add track start and end
-        bound_times = np.concatenate([[0.0], bound_times, [duration]])
-        bound_times = np.unique(np.sort(bound_times))
+        # ── Refine with MFCC-based agglomerative segmentation ─────────────────
+        # Adds timbral boundaries (texture/instrument changes). Wrapped in its own
+        # try so a librosa failure falls back cleanly to the energy-curve boundaries.
+        try:
+            hop_length = 512
+            mfcc       = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
+            mfcc_delta = librosa.feature.delta(mfcc)
+            features   = np.vstack([mfcc, mfcc_delta])
+            mfcc_bounds = librosa.segment.agglomerative(features, k=None)
+            mfcc_times  = librosa.frames_to_time(mfcc_bounds, sr=sr, hop_length=hop_length)
+            bound_times = np.unique(np.sort(np.concatenate([bound_times, mfcc_times])))
+        except Exception:
+            pass  # keep energy-curve boundaries as the sole basis
 
         # ── Build raw sections ────────────────────────────────────────────────
         raw_sections = []

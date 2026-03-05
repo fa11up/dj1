@@ -182,6 +182,7 @@ def run_module_5(paths, config, preview_mode=False, quality_mode=False, output_f
         preview_mode=preview_mode,
         quality_mode=quality_mode,
         stems_cache_dir=paths["stems_cache"],
+        config=config,
     )
 
 
@@ -346,9 +347,8 @@ def run_pipeline(config_path, from_module=1, preview_mode=False,
     _rule("═")
     print()
 
-    # Return success status
-    all_ok = all(r["status"] == "ok" for r in results.values()
-                 if results.get(num, {}).get("status") != "skipped")
+    # Return success status — skipped modules are never in results
+    all_ok = all(r["status"] == "ok" for r in results.values())
     return all_ok
 
 

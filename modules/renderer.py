@@ -28,7 +28,7 @@ Usage:
     uv run python -m modules.renderer --quality --output output/mix.wav
 """
 
-import sys, json, math, random, argparse, warnings, tempfile, time
+import sys, json, argparse, warnings, time
 from pathlib import Path
 from datetime import datetime
 
@@ -59,6 +59,15 @@ try:
     LIBROSA_AVAILABLE = True
 except Exception:
     LIBROSA_AVAILABLE = False
+
+try:
+    from mutagen.id3 import (
+        ID3, ID3NoHeaderError,
+        TIT2, TPE1, TALB, TCOM, COMM, TDRC, TCON, APIC,
+    )
+    ID3_AVAILABLE = True
+except Exception:
+    ID3_AVAILABLE = False
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -610,6 +619,35 @@ def apply_reverb(seg, room_size=REVERB_ROOM_SIZE, damping=REVERB_DAMPING,
         return seg
 
 
+def _reverb_bloom(seg, room_size=REVERB_ROOM_SIZE, damping=REVERB_DAMPING,
+                  wet_start=0.0, wet_end=REVERB_WET):
+    """
+    Apply reverb with a continuously growing wet level (smooth bloom).
+
+    Applies one reverb pass at 100% wet to capture the full room signal, then
+    blends dry and wet signals with a linearly growing time envelope:
+
+        output[t] = (1 − α(t)) × dry[t]  +  α(t) × wet[t],   α: wet_start → wet_end
+
+    This avoids the chunk-boundary discontinuities that arise when applying
+    reverb to discrete segments, giving a natural, continuous bloom.
+    Falls back to a single apply_reverb call if pedalboard or numpy fails.
+    """
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        full_wet = apply_reverb(seg, room_size=room_size, damping=damping,
+                                wet=1.0, dry=0.0)
+        dry = seg_to_float(seg)        # (channels, n_samples)
+        wet = seg_to_float(full_wet)
+        n   = min(dry.shape[-1], wet.shape[-1])
+        t   = np.linspace(wet_start, wet_end, n, dtype=np.float32)
+        mixed = dry[:, :n] * (1.0 - t) + wet[:, :n] * t
+        return float_to_seg(np.clip(mixed, -1.0, 1.0), seg.channels)
+    except Exception:
+        return apply_reverb(seg, room_size=room_size, damping=damping, wet=wet_end)
+
+
 def apply_delay(seg, delay_seconds=0.25, feedback=0.35, mix=0.35):
     """Apply slapback/echo delay via pedalboard."""
     if not PEDALBOARD_AVAILABLE:
@@ -645,10 +683,11 @@ def apply_phaser(seg, rate_hz=0.5, mix=0.40):
 
 def pitch_shift_seg(seg, semitones):
     """
-    Pitch-shift by semitones using pyrubberband. Clamped to ±6 st.
-    Returns original segment if rubberband unavailable or shift < 0.05 st.
+    Pitch-shift by semitones. Clamped to ±6 st.
+    Uses pyrubberband when available; falls back to librosa's phase vocoder.
+    Returns original segment if neither is available or shift < 0.05 st.
     """
-    if not RUBBERBAND_AVAILABLE or abs(semitones) < 0.05:
+    if abs(semitones) < 0.05:
         return seg
     semitones = max(-6.0, min(6.0, semitones))
     try:
@@ -656,11 +695,26 @@ def pitch_shift_seg(seg, semitones):
         samples /= (2 ** (seg.sample_width * 8 - 1))
         if seg.channels == 2:
             samples = samples.reshape(-1, 2)
-            l = pyrb.pitch_shift(samples[:, 0], SAMPLE_RATE, semitones)
-            r = pyrb.pitch_shift(samples[:, 1], SAMPLE_RATE, semitones)
+            if RUBBERBAND_AVAILABLE:
+                l = pyrb.pitch_shift(samples[:, 0], SAMPLE_RATE, semitones)
+                r = pyrb.pitch_shift(samples[:, 1], SAMPLE_RATE, semitones)
+            elif LIBROSA_AVAILABLE:
+                l = librosa.effects.pitch_shift(samples[:, 0], sr=SAMPLE_RATE,
+                                                n_steps=semitones)
+                r = librosa.effects.pitch_shift(samples[:, 1], sr=SAMPLE_RATE,
+                                                n_steps=semitones)
+            else:
+                return seg
             shifted = np.stack([l, r], axis=1).flatten()
         else:
-            shifted = pyrb.pitch_shift(samples.flatten(), SAMPLE_RATE, semitones)
+            samples_1d = samples.flatten()
+            if RUBBERBAND_AVAILABLE:
+                shifted = pyrb.pitch_shift(samples_1d, SAMPLE_RATE, semitones)
+            elif LIBROSA_AVAILABLE:
+                shifted = librosa.effects.pitch_shift(samples_1d, sr=SAMPLE_RATE,
+                                                      n_steps=semitones)
+            else:
+                return seg
         shifted = np.clip(shifted, -1.0, 1.0)
         pcm = (shifted * (2 ** 15 - 1)).astype(np.int16)
         return AudioSegment(pcm.tobytes(), frame_rate=SAMPLE_RATE,
@@ -678,6 +732,7 @@ def camelot_semitone_distance(cam_out, cam_in):
       Relative major/minor  → (3, ±1)   A↔B same number = 3 semitones
 
     Adjacent number (perfect 5th = 7 semitones) → (None, 0): too audible to shift.
+    Use _camelot_blur_factor to handle adjacent keys via chorus/phaser depth.
     """
     if not cam_out or not cam_in:
         return None, 0
@@ -693,6 +748,35 @@ def camelot_semitone_distance(cam_out, cam_in):
         direction = 1 if let_in == 'B' else -1
         return 3, direction
     return None, 0
+
+
+def _camelot_blur_factor(cam_out, cam_in):
+    """
+    Return a chorus/phaser depth multiplier based on Camelot harmonic distance.
+
+      Same key          → 0.6   minimal blur (tracks are already consonant)
+      Relative pair     → 0.9   mild blur (pitch shift covers the 3-semitone gap)
+      Adjacent (±1 pos) → 1.5   heavy blur to psychoacoustically mask the 7-st clash
+      Other / unknown   → 1.0   default
+
+    This lets render_harmonic_blend apply heavier stereo widening / detuning
+    when the key distance is larger, masking clashes without audible pitch artefacts.
+    """
+    if not cam_out or not cam_in:
+        return 1.0
+    try:
+        num_out, let_out = int(cam_out[:-1]), cam_out[-1].upper()
+        num_in,  let_in  = int(cam_in[:-1]),  cam_in[-1].upper()
+    except Exception:
+        return 1.0
+    if num_out == num_in and let_out == let_in:
+        return 0.6   # same key
+    if num_out == num_in:
+        return 0.9   # relative major/minor — pitch shift covers this
+    diff = abs(num_out - num_in) % 12
+    if diff == 1 or diff == 11:
+        return 1.5   # adjacent Camelot = perfect 5th = needs most masking
+    return 1.0
 
 
 def sweep_filter(seg, start_hz, end_hz, mode, n_steps=SWEEP_STEPS):
@@ -735,7 +819,7 @@ def sweep_filter(seg, start_hz, end_hz, mode, n_steps=SWEEP_STEPS):
 
 # ── New render functions ──────────────────────────────────────────────────────
 
-def render_filter_sweep(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+def render_filter_sweep(mix, incoming_seg, slot_out, slot_in, strategy, _chaos):
     """
     Spectral wipe: outgoing and incoming swap the frequency spectrum via mirror
     filter sweeps — at any moment they sum to approximately the full spectrum.
@@ -783,14 +867,14 @@ def render_filter_sweep(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
     return out_body + out_swept.overlay(in_swept) + in_body
 
 
-def render_reverb_wash(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+def render_reverb_wash(mix, incoming_seg, slot_out, slot_in, strategy, _chaos):
     """
     Reverb dissolution: at the breakdown, outgoing blooms into heavy reverb.
     Incoming fades in beneath the wash, creating an atmospheric bridge.
 
-    The reverb tail extends over two halves — moderate then heavy — so the
-    bloom grows naturally rather than snapping to maximum wet at the splice.
-    Works for any BPM delta because the reverb masks tempo differences.
+    The reverb wet level rises continuously from 0 → REVERB_WET over the full
+    wash window (_reverb_bloom), then fades to silence while the incoming track
+    fades in underneath. Works for any BPM delta.
     Best for mood shifts, key changes, and atmospheric / melancholic passages.
     """
     bpm        = slot_out.get("actual_bpm") or 120.0
@@ -820,12 +904,10 @@ def render_reverb_wash(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
         in_head_fad  = in_body[:fade_ms].fade_in(fade_ms)
         return out_body + out_tail_fad.overlay(in_head_fad) + in_body[fade_ms:]
 
-    # Reverb grows over two halves (moderate → heavy) then fades out
-    half          = max(1, len(out_tail) // 2)
-    out_first     = apply_reverb(out_tail[:half], room_size=0.55, wet=0.30, dry=0.70)
-    out_second    = apply_reverb(out_tail[half:], room_size=REVERB_ROOM_SIZE,
-                                 wet=REVERB_WET, dry=REVERB_DRY)
-    out_wash      = (out_first + out_second).fade_out(wash_ms)
+    # Reverb blooms continuously from dry → wet over the full wash window
+    out_wash = _reverb_bloom(out_tail,
+                             room_size=REVERB_ROOM_SIZE, damping=REVERB_DAMPING,
+                             wet_start=0.0, wet_end=REVERB_WET).fade_out(wash_ms)
 
     # Incoming fades in over the full wash window
     in_fade_ms    = min(wash_ms, len(in_body))
@@ -843,17 +925,18 @@ def render_reverb_wash(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
     return out_body + out_wash.overlay(in_head) + in_rest
 
 
-def render_harmonic_blend(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+def render_harmonic_blend(mix, incoming_seg, slot_out, slot_in, strategy, _chaos):
     """
     Harmonically conscious phase-swap blend.
 
     Same 4-phase structure as long_blend but with two enhancements:
-      1. Chorus widening on the overlap phases — blurs key differences,
-         widens stereo image, makes the blend feel larger than a simple EQ swap.
-      2. Pitch correction: if the tracks are a relative major/minor pair
-         (same Camelot number, different letter = 3 semitones), the incoming's
-         blend window is pitch-shifted to match the outgoing's key. After the
-         overlap resolves, the incoming plays at its natural pitch.
+      1. Camelot-aware chorus/phaser: depth scales with harmonic distance between
+         tracks (_camelot_blur_factor). Adjacent keys (±1 position, perfect 5th)
+         get heavier stereo widening and phaser mix to mask the key clash.
+         Same-key transitions use lighter blur (already consonant).
+      2. Pitch correction for relative major/minor pairs (same Camelot number,
+         different letter = 3 semitones): the incoming's blend window is shifted
+         to match the outgoing key, then returns to natural pitch after the swap.
 
     Select for: Camelot-adjacent tracks, BPM delta < 6%, peak-of-set moments.
     """
@@ -902,25 +985,31 @@ def render_harmonic_blend(mix, incoming_seg, slot_out, slot_in, strategy, chaos)
     inc_p4   = incoming_seg[highs_ms + swap_ms : highs_ms + swap_ms + outro_ms]
     inc_body = incoming_seg[highs_ms + swap_ms + outro_ms:]
 
+    # Chorus/phaser depth scales with Camelot harmonic distance:
+    #   same key → light blur, adjacent key (7 st) → heavy blur to mask clash
+    blur = _camelot_blur_factor(cam_out, cam_in)
+
     # Phase 2: incoming highs + chorus widening over outgoing full
     inc_p2_hi  = apply_highpass_adaptive(inc_p2, highs_hz, 0.0)
-    inc_p2_ch  = apply_chorus(inc_p2_hi)
-    out_p2_ch  = apply_chorus(out_p2)
+    inc_p2_ch  = apply_chorus(inc_p2_hi, depth=min(0.40, 0.15 * blur),
+                                         mix=min(0.70, 0.45 * blur))
+    out_p2_ch  = apply_chorus(out_p2,    depth=min(0.32, 0.12 * blur),
+                                         mix=min(0.60, 0.38 * blur))
     overlap_p2 = out_p2_ch.overlay(inc_p2_ch)
 
     # Phase 3: bass swap — tight, no chorus (decisiveness)
     out_p3_nb  = apply_highpass_adaptive(out_p3, bass_hz, 0.0)
     overlap_p3 = out_p3_nb.overlay(inc_p3)
 
-    # Phase 4: outgoing highs fade with phaser shimmer, incoming takes over
+    # Phase 4: outgoing highs fade with phaser shimmer scaled by harmonic distance
     out_p4_hi  = apply_highpass_adaptive(out_p4, highs_hz, 0.0).fade_out(outro_ms)
-    out_p4_ph  = apply_phaser(out_p4_hi)
+    out_p4_ph  = apply_phaser(out_p4_hi, mix=min(0.65, 0.40 * blur))
     overlap_p4 = inc_p4.overlay(out_p4_ph)
 
     return out_body + overlap_p2 + overlap_p3 + overlap_p4 + inc_body
 
 
-def render_tension_drop(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+def render_tension_drop(mix, incoming_seg, slot_out, _slot_in, strategy, _chaos):
     """
     Build-and-release tension: a rising highpass filter sweeps the bass out of
     the outgoing track over N bars, creating mounting anticipation. At the phrase
@@ -970,7 +1059,7 @@ def render_tension_drop(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
     return out_body + out_tension + in_head + in_body
 
 
-def render_loop_roll(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+def render_loop_roll(mix, incoming_seg, slot_out, _slot_in, strategy, _chaos):
     """
     Classic DJ loop roll — captures the last N bars of the outgoing track in a
     repeating loop, then fades the incoming track up underneath it over successive
@@ -1047,7 +1136,7 @@ def render_loop_roll(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
     return out_body + overlap + inc_body
 
 
-def render_loop_stutter(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+def render_loop_stutter(mix, incoming_seg, slot_out, _slot_in, strategy, _chaos):
     """
     Buffer stutter roll — the outgoing track is caught in a progressively
     shorter loop: starting at N bars, halving each stage (N → N/2 → N/4 → 1),
@@ -1111,9 +1200,8 @@ def transition_strategy(hint, chaos, preview_mode, bpm=None, quality_mode=False)
     """
     Return a strategy dict describing how to execute the transition.
 
-    CHANGED: quality_mode now controls stretch/phrase-align/EQ independently
-    of chaos. Chaos only affects musical choices (swap bar count), NOT
-    pipeline quality.
+    quality_mode controls stretch/phrase-align/EQ independently of chaos.
+    Chaos affects musical choices (swap bar count) only, not pipeline quality.
 
     For long_blend:  staged 3-phase DJ transition (the real deal)
     For crossfade:   simple overlapping volume fade with EQ
@@ -1292,8 +1380,7 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
                (tight at low chaos, loose at high chaos)
       Phase 4  incoming plays full-range; outgoing highs/mids fade out
 
-    CHANGED: EQ filters always use steep/cascaded mode. The old chaos-gated
-    shelf mode was causing bass bleed and muddiness in transitions.
+    EQ filters always use steep/cascaded mode — shelf mode causes bass bleed.
     """
     bpm        = slot_out.get("actual_bpm") or 120.0
     beat_times = slot_out.get("beat_times") or []
@@ -1417,16 +1504,13 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
     inc_body  = incoming[highs_ms+swap_ms+outro_ms:]
 
     # ── Phase 2: incoming highs only over outgoing full range ─────────────────
-    # CHANGED: always use chaos=0.0 for steep filter — no shelf mode
     inc_p2_hi  = apply_highpass_adaptive(inc_p2, highs_hz, 0.0)
     overlap_p2 = out_p2.overlay(inc_p2_hi)
     # ── Phase 3: bass swap — decisive, tight window ───────────────────────────
-    # CHANGED: always steep EQ
     out_p3_nobase = apply_highpass_adaptive(out_p3, bass_hz, 0.0)
     inc_p3_full   = inc_p3
     overlap_p3    = out_p3_nobase.overlay(inc_p3_full)
     # ── Phase 4: outgoing highs fade out, incoming full range ─────────────────
-    # CHANGED: always steep EQ
     out_p4_hi  = apply_highpass_adaptive(out_p4, highs_hz, 0.0).fade_out(outro_ms)
     overlap_p4 = inc_p4.overlay(out_p4_hi)
     return out_body + overlap_p2 + overlap_p3 + overlap_p4 + inc_body
@@ -1514,7 +1598,6 @@ def render_transition(outgoing, incoming, prev_seg_raw, slot_out, slot_in,
         bass_hz      = compute_crossover_hz(centroid)
         out_tail_raw = outgoing[-fade_ms:]
         in_head_raw  = incoming[:fade_ms]
-        # CHANGED: always use steep EQ (chaos=0.0) — gentle shelf causes bleed
         out_tail_eq  = apply_highpass_adaptive(out_tail_raw, bass_hz, 0.0)
         in_head_eq   = apply_highpass_adaptive(in_head_raw,  bass_hz, 0.0)
         outgoing  = outgoing[:-fade_ms] + out_tail_eq
@@ -1567,7 +1650,6 @@ def render_stem_blend(mix, incoming_seg, prev_seg_raw, slot_out, slot_in,
         return render_staged(mix, incoming_seg, slot_out, slot_in, strategy, chaos=chaos)
 
     # ── Phase timing (same as staged) ────────────────────────────────────────
-    bpm      = slot_out.get("actual_bpm") or 120.0
     highs_ms = strategy["highs_ms"]
     swap_ms  = strategy["swap_ms"]
     outro_ms = strategy["outro_ms"]
@@ -1601,7 +1683,6 @@ def render_stem_blend(mix, incoming_seg, prev_seg_raw, slot_out, slot_in,
 
     out_p3_start = out_t_start + highs_ms
     out_p3_drums = out_stems["drums"][out_p3_start : out_p3_start + swap_ms]
-    out_p3_bass  = out_stems["bass"] [out_p3_start : out_p3_start + swap_ms]
     out_p3_mel   = out_stems["other"][out_p3_start : out_p3_start + swap_ms]
 
     out_p4_start = out_p3_start + swap_ms
@@ -1613,7 +1694,6 @@ def render_stem_blend(mix, incoming_seg, prev_seg_raw, slot_out, slot_in,
     in_p3_bass   = in_stems["bass"]  [highs_ms : highs_ms + swap_ms]
     in_p3_drums  = in_stems["drums"] [highs_ms : highs_ms + swap_ms]
     in_p3_mel    = in_stems["other"] [highs_ms : highs_ms + swap_ms]
-    in_p4_mel    = in_stems["other"] [highs_ms + swap_ms : highs_ms + swap_ms + outro_ms]
     in_body      = incoming_seg[total_ms:]
 
     # ── Mix each phase ────────────────────────────────────────────────────────
@@ -1682,7 +1762,52 @@ def render_session(setlist, chaos, preview_mode, progress_cb=None, quality_mode=
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
-def export_mix(mix, output_path, preview_mode):
+def write_id3_tags(path, metadata):
+    """
+    Write ID3v2 tags to an MP3 file using mutagen.
+    Supported fields: title, artist, album, composer, genre, year, comment, artwork_path.
+    Fails silently — a tag write error never aborts the export.
+    """
+    if not ID3_AVAILABLE or not metadata:
+        return
+    try:
+        try:
+            tags = ID3(path)
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        if metadata.get("title"):
+            tags["TIT2"] = TIT2(encoding=3, text=metadata["title"])
+        if metadata.get("artist"):
+            tags["TPE1"] = TPE1(encoding=3, text=metadata["artist"])
+        if metadata.get("album"):
+            tags["TALB"] = TALB(encoding=3, text=metadata["album"])
+        if metadata.get("composer"):
+            tags["TCOM"] = TCOM(encoding=3, text=metadata["composer"])
+        if metadata.get("genre"):
+            tags["TCON"] = TCON(encoding=3, text=metadata["genre"])
+        if metadata.get("year"):
+            tags["TDRC"] = TDRC(encoding=3, text=str(metadata["year"]))
+        if metadata.get("comment"):
+            tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=metadata["comment"])
+        if metadata.get("artwork_path"):
+            img_path = Path(metadata["artwork_path"]).expanduser()
+            if img_path.exists():
+                mime = ("image/jpeg" if img_path.suffix.lower() in (".jpg", ".jpeg")
+                        else "image/png")
+                tags["APIC"] = APIC(
+                    encoding=3,
+                    mime=mime,
+                    type=3,        # Cover (front)
+                    desc="Cover",
+                    data=img_path.read_bytes(),
+                )
+        tags.save(path)
+    except Exception as e:
+        print(f"  ⚠  ID3 tagging failed: {e}")
+
+
+def export_mix(mix, output_path, preview_mode, metadata=None):
     """Export the final mix to MP3 or WAV based on file extension and mode."""
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1695,6 +1820,10 @@ def export_mix(mix, output_path, preview_mode):
         export_kwargs["bitrate"] = bitrate
 
     mix.export(str(out), **export_kwargs)
+
+    if fmt == "mp3":
+        write_id3_tags(str(out), metadata)
+
     size_mb = out.stat().st_size / (1024 * 1024)
     return size_mb
 
@@ -1721,6 +1850,7 @@ def run(
     preview_mode    = False,
     quality_mode    = False,
     stems_cache_dir = "./data/.stems_cache",
+    config          = None,
 ):
     print("─" * 60 + "\n  AutoDJ — Module 5: Renderer\n" + "─" * 60)
 
@@ -1795,8 +1925,34 @@ def run(
     if mix is None:
         sys.exit("✗ Render failed — no audio could be loaded from setlist.")
 
+    # ── Build ID3 metadata ────────────────────────────────────────────────────
+    metadata = None
+    if config:
+        id3_cfg  = config.get("id3", {})
+        now      = datetime.now()
+        title    = f"AutoDJ Mix \u2014 {now.strftime('%Y-%m-%d %H:%M')}"
+        tracklist_lines = []
+        for i, slot in enumerate(setlist, 1):
+            name    = slot.get("title") or slot.get("filename") or slot.get("track_id", "?")
+            bpm_val = slot.get("actual_bpm") or slot.get("bpm") or ""
+            cam     = slot.get("camelot") or ""
+            hint    = slot.get("transition_hint") or ""
+            parts   = [x for x in [f"{bpm_val:.0f} BPM" if bpm_val else "", cam, hint] if x]
+            suffix  = f"  ({', '.join(parts)})" if parts else ""
+            tracklist_lines.append(f"{i:02d}. {name}{suffix}")
+        metadata = {
+            "title":     title,
+            "artist":    id3_cfg.get("artist", ""),
+            "album":     id3_cfg.get("album", ""),
+            "composer":  id3_cfg.get("composer", ""),
+            "genre":     id3_cfg.get("genre", ""),
+            "year":      str(now.year),
+            "comment":   "\n".join(tracklist_lines),
+            "artwork":   id3_cfg.get("artwork", ""),
+        }
+
     print(f"\n  Exporting...")
-    size_mb  = export_mix(mix, output_path, preview_mode)
+    size_mb  = export_mix(mix, output_path, preview_mode, metadata=metadata)
     elapsed  = time.time() - start_time
     duration_actual = len(mix) / 1000 / 60
 

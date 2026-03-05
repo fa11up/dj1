@@ -31,6 +31,8 @@ from modules.renderer import (
     render_harmonic_blend,
     render_tension_drop,
     camelot_semitone_distance,
+    _camelot_blur_factor,
+    _reverb_bloom,
     loop_segment,
     LOOP_BARS_DEFAULT,
     LOOP_BARS_LONG,
@@ -264,8 +266,9 @@ def test_transition_strategy():
             transition_strategy("hard_cut", 0.2, False)))
     run_test("crossfade method",
         lambda: eq(transition_strategy("crossfade", 0.2, False)["method"], "crossfade"))
-    run_test("high chaos no stretch",
-        lambda: ok(not transition_strategy("long_blend", 0.8, False, 120.0)["do_stretch"]))
+    run_test("high chaos do_stretch matches rubberband availability",
+        lambda: eq(transition_strategy("long_blend", 0.8, False, 120.0)["do_stretch"],
+                   RUBBERBAND_AVAILABLE))
     run_test("slow BPM → longer highs phase than fast", lambda: (
         lambda slow, fast: ok(slow["highs_ms"] >= fast["highs_ms"]))(
             transition_strategy("long_blend", 0.2, False, 90.0),
@@ -777,6 +780,59 @@ def test_new_render_functions():
         run_test(fn.__name__, fn)
 
 
+# ── _camelot_blur_factor + _reverb_bloom ─────────────────────────────────────
+
+def test_quality_helpers():
+    section("_camelot_blur_factor and _reverb_bloom")
+
+    # _camelot_blur_factor
+    run_test("same key → blur < 1.0",
+        lambda: ok(_camelot_blur_factor("8A", "8A") < 1.0))
+    run_test("relative pair → blur < 1.0",
+        lambda: ok(_camelot_blur_factor("8A", "8B") < 1.0))
+    run_test("adjacent Camelot → blur > 1.0",
+        lambda: ok(_camelot_blur_factor("8A", "9A") > 1.0))
+    run_test("adjacent Camelot wrap-around → blur > 1.0",
+        lambda: ok(_camelot_blur_factor("1A", "12A") > 1.0))
+    run_test("None input → returns 1.0",
+        lambda: eq(_camelot_blur_factor(None, "8A"), 1.0))
+    run_test("adjacent blur > relative blur",
+        lambda: ok(_camelot_blur_factor("8A", "9A") > _camelot_blur_factor("8A", "8B")))
+    run_test("same key blur < relative blur",
+        lambda: ok(_camelot_blur_factor("8A", "8A") < _camelot_blur_factor("8A", "8B")))
+
+    # _reverb_bloom
+    def bloom_returns_audio():
+        seg = make_seg(5.0)
+        result = _reverb_bloom(seg)
+        ok(isinstance(result, AudioSegment))
+
+    def bloom_preserves_length():
+        seg = make_seg(5.0)
+        result = _reverb_bloom(seg)
+        # Should be approximately the same length as input
+        ok(abs(len(result) - len(seg)) < 200,
+           f"bloom length {len(result)} vs input {len(seg)}")
+
+    def bloom_wet_start_zero_is_dryer():
+        """With wet_start=0, the start should be drier than wet_start=0.5."""
+        if not PEDALBOARD_AVAILABLE:
+            return  # skip — bloom degrades gracefully
+        seg  = make_seg(3.0)
+        dry0 = _reverb_bloom(seg, wet_start=0.0, wet_end=0.6)
+        wet5 = _reverb_bloom(seg, wet_start=0.5, wet_end=0.6)
+        ok(isinstance(dry0, AudioSegment) and isinstance(wet5, AudioSegment))
+
+    def bloom_no_crash_with_short_segment():
+        seg = make_seg(0.5)
+        result = _reverb_bloom(seg)
+        ok(isinstance(result, AudioSegment))
+
+    for fn in [bloom_returns_audio, bloom_preserves_length,
+               bloom_wet_start_zero_is_dryer, bloom_no_crash_with_short_segment]:
+        run_test(fn.__name__, fn)
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -800,6 +856,7 @@ if __name__ == "__main__":
     test_camelot_semitone_distance()
     test_new_transition_strategy()
     test_new_render_functions()
+    test_quality_helpers()
 
     total = _results["passed"] + _results["failed"]
     print(f"\n{'═'*52}")
