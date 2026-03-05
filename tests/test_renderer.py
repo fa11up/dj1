@@ -24,10 +24,21 @@ from modules.renderer import (
     energy_aware_hint,
     transition_strategy,
     render_transition,
+    render_loop_roll,
+    render_loop_stutter,
+    render_filter_sweep,
+    render_reverb_wash,
+    render_harmonic_blend,
+    render_tension_drop,
+    camelot_semitone_distance,
     loop_segment,
     LOOP_BARS_DEFAULT,
     LOOP_BARS_LONG,
     LOOP_MAX_REPEATS,
+    LOOP_ROLL_BARS,
+    LOOP_ROLL_REPS,
+    LOOP_STUTTER_BARS,
+    LOOP_STUTTER_REPS,
     SOFT_ENERGY_THRESHOLD,
     EQ_BASS_HZ,
     RUBBERBAND_AVAILABLE,
@@ -285,7 +296,8 @@ def test_render_transition():
     def hard_cut_sequential():
         out  = make_seg(20.0)
         inc  = make_seg(20.0)
-        result = render_transition(out, inc, make_slot(hint="hard_cut"),
+        result = render_transition(out, inc, None,
+                                   make_slot(hint="hard_cut"),
                                    make_slot(hint="hard_cut"), chaos=0.3, preview_mode=False)
         # Sequential fade out + fade in = ~full sum, no overlap
         approx(len(result) / 1000, 40.0, 1.5)
@@ -293,14 +305,16 @@ def test_render_transition():
     def crossfade_shorter_than_sum():
         out  = make_seg(20.0)
         inc  = make_seg(20.0)
-        result = render_transition(out, inc, make_slot(hint="crossfade"),
+        result = render_transition(out, inc, None,
+                                   make_slot(hint="crossfade"),
                                    make_slot(hint="crossfade"), chaos=0.1, preview_mode=False)
         ok(len(result) < len(out) + len(inc))
 
     def result_is_audio_segment():
         out  = make_seg(15.0)
         inc  = make_seg(15.0)
-        result = render_transition(out, inc, make_slot(hint="crossfade"),
+        result = render_transition(out, inc, None,
+                                   make_slot(hint="crossfade"),
                                    make_slot(hint="crossfade", bpm=128.0),
                                    chaos=0.3, preview_mode=True)
         ok(isinstance(result, AudioSegment))
@@ -308,7 +322,8 @@ def test_render_transition():
     def high_chaos_produces_output():
         out  = make_seg(15.0)
         inc  = make_seg(15.0)
-        result = render_transition(out, inc, make_slot(hint="long_blend"),
+        result = render_transition(out, inc, None,
+                                   make_slot(hint="long_blend"),
                                    make_slot(hint="long_blend"),
                                    chaos=0.95, preview_mode=False)
         ok(isinstance(result, AudioSegment) and len(result) > 0)
@@ -316,7 +331,8 @@ def test_render_transition():
     def preview_mode_works():
         out  = make_seg(60.0)
         inc  = make_seg(60.0)
-        result = render_transition(out, inc, make_slot(hint="long_blend"),
+        result = render_transition(out, inc, None,
+                                   make_slot(hint="long_blend"),
                                    make_slot(hint="long_blend"),
                                    chaos=0.1, preview_mode=True)
         ok(isinstance(result, AudioSegment))
@@ -324,7 +340,8 @@ def test_render_transition():
     def staged_transition_no_crash():
         out  = make_seg(90.0)
         inc  = make_seg(90.0)
-        result = render_transition(out, inc, make_slot(hint="long_blend"),
+        result = render_transition(out, inc, None,
+                                   make_slot(hint="long_blend"),
                                    make_slot(hint="long_blend"),
                                    chaos=0.2, preview_mode=False)
         ok(isinstance(result, AudioSegment) and len(result) > 0)
@@ -406,7 +423,7 @@ def test_looped_transitions():
         out = make_seg(15.0)   # short — might not have enough for full blend
         inc = make_seg(60.0)
         result = render_transition(
-            out, inc,
+            out, inc, None,
             make_slot(hint="long_blend", bpm=120.0),
             make_slot(hint="long_blend", bpm=120.0),
             chaos=0.2, preview_mode=False,
@@ -419,7 +436,7 @@ def test_looped_transitions():
         out = make_seg(90.0)
         inc = make_seg(90.0)
         result = render_transition(
-            out, inc,
+            out, inc, None,
             make_slot(hint="long_blend", bpm=128.0),
             make_slot(hint="long_blend", bpm=128.0),
             chaos=0.3, preview_mode=False,
@@ -435,12 +452,11 @@ def test_looped_transitions():
         out = make_seg(20.0)
         inc = make_seg(60.0)
         result = render_transition(
-            out, inc,
+            out, inc, None,
             make_slot(hint="long_blend", bpm=120.0),
             make_slot(hint="long_blend", bpm=120.0),
             chaos=0.2, preview_mode=False,
         )
-        simple_concat_ms = len(out) + len(inc)
         # The result with looping should have added content
         ok(isinstance(result, AudioSegment) and len(result) > 0)
 
@@ -449,7 +465,7 @@ def test_looped_transitions():
         out = make_seg(30.0)
         inc = make_seg(30.0)
         result = render_transition(
-            out, inc,
+            out, inc, None,
             make_slot(hint="long_blend", bpm=120.0),
             make_slot(hint="long_blend", bpm=120.0),
             chaos=0.2, preview_mode=True,
@@ -461,7 +477,7 @@ def test_looped_transitions():
         out = make_seg(30.0)
         inc = make_seg(30.0)
         result = render_transition(
-            out, inc,
+            out, inc, None,
             make_slot(hint="long_blend", bpm=128.0),
             make_slot(hint="long_blend", bpm=128.0),
             chaos=0.9, preview_mode=False,
@@ -568,6 +584,199 @@ def test_breakdown_from_sections():
         run_test(fn.__name__, fn)
         
 
+# ── camelot_semitone_distance ─────────────────────────────────────────────────
+
+def test_camelot_semitone_distance():
+    section("camelot_semitone_distance")
+
+    run_test("identical → 0 semitones",
+        lambda: eq(camelot_semitone_distance("8A", "8A"), (0, 0)))
+    run_test("relative pair A→B → 3 st, direction +1",
+        lambda: eq(camelot_semitone_distance("8A", "8B"), (3, 1)))
+    run_test("relative pair B→A → 3 st, direction -1",
+        lambda: eq(camelot_semitone_distance("8B", "8A"), (3, -1)))
+    run_test("adjacent number → None (too far to shift)",
+        lambda: eq(camelot_semitone_distance("8A", "9A")[0], None))
+    run_test("None input → None",
+        lambda: eq(camelot_semitone_distance(None, "8A")[0], None))
+    run_test("both None → None",
+        lambda: eq(camelot_semitone_distance(None, None)[0], None))
+
+
+# ── New transition strategy ───────────────────────────────────────────────────
+
+def test_new_transition_strategy():
+    section("transition_strategy — new transition types")
+
+    def _s(hint, bpm=128.0, chaos=0.3, preview=False):
+        return transition_strategy(hint, chaos, preview, bpm=bpm)
+
+    # filter_sweep
+    run_test("filter_sweep → method=filter_sweep",
+        lambda: eq(_s("filter_sweep")["method"], "filter_sweep"))
+    run_test("filter_sweep has sweep_ms",
+        lambda: ok("sweep_ms" in _s("filter_sweep")))
+    run_test("filter_sweep preview → shorter sweep",
+        lambda: ok(_s("filter_sweep", preview=True)["sweep_ms"]
+                   < _s("filter_sweep")["sweep_ms"]))
+
+    # reverb_wash
+    run_test("reverb_wash → method=reverb_wash",
+        lambda: eq(_s("reverb_wash")["method"], "reverb_wash"))
+    run_test("reverb_wash has wash_ms",
+        lambda: ok("wash_ms" in _s("reverb_wash")))
+    run_test("reverb_wash preview → shorter wash",
+        lambda: ok(_s("reverb_wash", preview=True)["wash_ms"]
+                   < _s("reverb_wash")["wash_ms"]))
+
+    # harmonic_blend
+    run_test("harmonic_blend → method=harmonic_blend",
+        lambda: eq(_s("harmonic_blend")["method"], "harmonic_blend"))
+    run_test("harmonic_blend has phase keys",
+        lambda: ok(all(k in _s("harmonic_blend") for k in ("highs_ms", "swap_ms", "outro_ms"))))
+
+    # tension_drop
+    run_test("tension_drop → method=tension_drop",
+        lambda: eq(_s("tension_drop")["method"], "tension_drop"))
+    run_test("tension_drop has build_ms",
+        lambda: ok("build_ms" in _s("tension_drop")))
+    run_test("tension_drop never stretches",
+        lambda: ok(not _s("tension_drop")["do_stretch"]))
+
+    # loop_roll
+    run_test("loop_roll → method=loop_roll",
+        lambda: eq(_s("loop_roll")["method"], "loop_roll"))
+    run_test("loop_roll has loop_bars + n_reps",
+        lambda: ok("loop_bars" in _s("loop_roll") and "n_reps" in _s("loop_roll")))
+    run_test("loop_roll preview → fewer reps",
+        lambda: ok(_s("loop_roll", preview=True)["n_reps"]
+                   <= _s("loop_roll")["n_reps"]))
+    run_test("loop_roll never stretches",
+        lambda: ok(not _s("loop_roll")["do_stretch"]))
+
+    # loop_stutter
+    run_test("loop_stutter → method=loop_stutter",
+        lambda: eq(_s("loop_stutter")["method"], "loop_stutter"))
+    run_test("loop_stutter has stutter_bars + reps_per_len",
+        lambda: ok("stutter_bars" in _s("loop_stutter") and
+                   "reps_per_len" in _s("loop_stutter")))
+    run_test("loop_stutter preview → fewer bars/reps",
+        lambda: ok(_s("loop_stutter", preview=True)["stutter_bars"]
+                   <= _s("loop_stutter")["stutter_bars"]))
+    run_test("loop_stutter never stretches",
+        lambda: ok(not _s("loop_stutter")["do_stretch"]))
+
+
+# ── New render functions ───────────────────────────────────────────────────────
+
+def test_new_render_functions():
+    section("new render functions — smoke tests")
+
+    slot_out = make_slot(bpm=128.0, camelot="8A", hint="crossfade")
+    slot_in  = make_slot(bpm=128.0, camelot="8B", hint="crossfade")
+
+    def _mix(dur=60.0): return make_seg(dur)
+    def _inc(dur=30.0): return make_seg(dur)
+
+    def filter_sweep_returns_audio():
+        strategy = transition_strategy("filter_sweep", 0.3, False, bpm=128.0)
+        result = render_filter_sweep(_mix(), _inc(), slot_out, slot_in, strategy, 0.3)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def reverb_wash_returns_audio():
+        strategy = transition_strategy("reverb_wash", 0.3, False, bpm=128.0)
+        result = render_reverb_wash(_mix(), _inc(), slot_out, slot_in, strategy, 0.3)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def harmonic_blend_returns_audio():
+        strategy = transition_strategy("harmonic_blend", 0.3, False, bpm=128.0)
+        result = render_harmonic_blend(_mix(90.0), _inc(60.0), slot_out, slot_in, strategy, 0.3)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def tension_drop_returns_audio():
+        strategy = transition_strategy("tension_drop", 0.6, False, bpm=128.0)
+        result = render_tension_drop(_mix(), _inc(), slot_out, slot_in, strategy, 0.6)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def loop_roll_returns_audio():
+        strategy = transition_strategy("loop_roll", 0.3, False, bpm=128.0)
+        result = render_loop_roll(_mix(60.0), _inc(30.0), slot_out, slot_in, strategy, 0.3)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def loop_roll_overlap_region_correct():
+        """The overlap (loop × n_reps) should be >= loop_bars × n_reps bars."""
+        strategy = transition_strategy("loop_roll", 0.3, False, bpm=128.0)
+        mix = _mix(60.0)
+        inc = _inc(30.0)
+        result = render_loop_roll(mix, inc, slot_out, slot_in, strategy, 0.3)
+        # Result must be shorter than simple concat (overlap region)
+        ok(len(result) < len(mix) + len(inc),
+           "loop_roll should create an overlap (shorter than concat)")
+
+    def loop_roll_short_mix_fallback():
+        """Too-short mix should fall back gracefully, not crash."""
+        strategy = transition_strategy("loop_roll", 0.3, False, bpm=128.0)
+        result = render_loop_roll(make_seg(2.0), _inc(), slot_out, slot_in, strategy, 0.3)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def loop_stutter_returns_audio():
+        strategy = transition_strategy("loop_stutter", 0.5, False, bpm=128.0)
+        result = render_loop_stutter(_mix(), _inc(), slot_out, slot_in, strategy, 0.5)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def loop_stutter_longer_than_incoming_alone():
+        """Stutter adds content before the incoming track."""
+        strategy = transition_strategy("loop_stutter", 0.5, False, bpm=128.0)
+        inc = _inc(20.0)
+        result = render_loop_stutter(_mix(60.0), inc, slot_out, slot_in, strategy, 0.5)
+        ok(len(result) > len(inc), "stutter adds content before incoming")
+
+    def loop_stutter_preview_no_crash():
+        strategy = transition_strategy("loop_stutter", 0.5, True, bpm=128.0)
+        result = render_loop_stutter(_mix(), _inc(), slot_out, slot_in, strategy, 0.5)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    # Integration via render_transition dispatch
+    def loop_roll_via_render_transition():
+        mix = make_seg(60.0)
+        inc = make_seg(30.0)
+        result = render_transition(mix, inc, None,
+                                   make_slot(bpm=128.0, hint="loop_roll"),
+                                   make_slot(bpm=128.0, hint="loop_roll"),
+                                   chaos=0.3, preview_mode=False)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def loop_stutter_via_render_transition():
+        mix = make_seg(60.0)
+        inc = make_seg(30.0)
+        result = render_transition(mix, inc, None,
+                                   make_slot(bpm=128.0, hint="loop_stutter"),
+                                   make_slot(bpm=128.0, hint="loop_stutter"),
+                                   chaos=0.5, preview_mode=False)
+        ok(isinstance(result, AudioSegment) and len(result) > 0)
+
+    def bpm_safety_gate_downgrades_loop_roll():
+        """loop_roll is in overlap_methods — large BPM delta should downgrade to hard_cut."""
+        mix = make_seg(60.0)
+        inc = make_seg(30.0)
+        result = render_transition(mix, inc, None,
+                                   make_slot(bpm=100.0, hint="loop_roll"),
+                                   make_slot(bpm=140.0, hint="loop_roll"),  # 33% delta
+                                   chaos=0.3, preview_mode=False)
+        ok(isinstance(result, AudioSegment) and len(result) > 0,
+           "BPM safety gate should downgrade, not crash")
+
+    for fn in [filter_sweep_returns_audio, reverb_wash_returns_audio,
+               harmonic_blend_returns_audio, tension_drop_returns_audio,
+               loop_roll_returns_audio, loop_roll_overlap_region_correct,
+               loop_roll_short_mix_fallback,
+               loop_stutter_returns_audio, loop_stutter_longer_than_incoming_alone,
+               loop_stutter_preview_no_crash,
+               loop_roll_via_render_transition, loop_stutter_via_render_transition,
+               bpm_safety_gate_downgrades_loop_roll]:
+        run_test(fn.__name__, fn)
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -588,6 +797,9 @@ if __name__ == "__main__":
     test_loop_segment()
     test_looped_transitions()
     test_breakdown_from_sections()
+    test_camelot_semitone_distance()
+    test_new_transition_strategy()
+    test_new_render_functions()
 
     total = _results["passed"] + _results["failed"]
     print(f"\n{'═'*52}")

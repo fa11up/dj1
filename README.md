@@ -99,7 +99,10 @@ dj1/
 │   ├── test_analyzer.py
 │   ├── test_spotify_bridge.py
 │   ├── test_planner.py
-│   └── test_renderer.py
+│   ├── test_renderer.py
+│   ├── test_brain.py
+│   ├── test_stems.py
+│   └── test_creative.py
 ├── data/                      # Runtime JSON (gitignored)
 │   ├── tracks.json            # Module 1 output
 │   ├── analysis.json          # Module 2 output
@@ -284,6 +287,38 @@ compatibility (Camelot rules 1–3).
 
 Stems are cached under `data/.stems_cache/` so separation only runs once per track.
 
+### Filter sweep (`filter_sweep`)
+A high-pass filter sweeps up through the outgoing track (8–16 bars), stripping
+bass and mids until only shimmering highs remain, then the incoming track
+hard-cuts in at full energy. Works on any BPM delta.
+
+### Reverb wash (`reverb_wash`)
+The outgoing track's tail is convolved into a long reverb cloud (4–8 bars),
+fading out as the incoming track rises underneath. Creates a spatial,
+atmospheric handoff. Works on any BPM delta.
+
+### Harmonic blend (`harmonic_blend`)
+A pitched crossfade that shifts the outgoing track's pitch toward the incoming
+key before fading. Requires harmonic compatibility (Camelot rules). Smoother
+than a raw crossfade for adjacent-key transitions.
+
+### Tension drop (`tension_drop`)
+Builds energy by layering the incoming track under the outgoing for 4–8 bars
+with a gradual filter open, then drops both in simultaneously at a phrase
+boundary. Engineered for peak-time moments.
+
+### Loop roll (`loop_roll`)
+Captures the last N bars of the outgoing track as a phrase-aligned loop, repeats
+it 3× (with bass highpassed in the second half to clear headroom), while the
+incoming track fades in underneath. Best for same-tempo transitions where the
+outgoing hook should echo before the new track lands.
+
+### Loop stutter (`loop_stutter`)
+A buffer stutter roll that progressively halves the loop length (4 → 2 → 1 bars,
+2 reps each stage) before hard-cutting to the incoming track's drop with a
+1-bar fade-in. No BPM constraint — the stutter itself masks any tempo shift.
+Best used at drop-to-drop moments.
+
 ### Other transition types
 - **`crossfade`** — overlapping volume fade with EQ bass-cut at low chaos
 - **`quick_fade`** — short volume fade, no EQ
@@ -304,8 +339,13 @@ uv run python tests/test_ingestor.py
 uv run python tests/test_analyzer.py
 uv run python tests/test_spotify_bridge.py
 uv run python tests/test_planner.py
-uv run python tests/test_renderer.py
+uv run python tests/test_renderer.py   # transitions, strategy, render functions
+uv run python tests/test_brain.py      # AI planner schema, setlist logic, prompts
+uv run python tests/test_stems.py      # stem cache helpers, path logic, fallbacks
+uv run python tests/test_creative.py  # bars_to_ms, channel mixing, stem prep
 ```
+
+No API calls or demucs required — all tests use synthetic audio or mock data.
 
 ---
 
@@ -332,5 +372,3 @@ uv run python tests/test_renderer.py
   Module 3 uses local analysis only — Spotify provides track names for matching only.
 - demucs has no Python 3.14 wheels as of early 2026. Use Python 3.12 for stem blends,
   or install demucs via homebrew/conda and ensure it's in PATH.
-- Loop-based transitions (extend a 4-bar loop before the incoming track enters)
-  are planned for a future phase.

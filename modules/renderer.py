@@ -125,6 +125,15 @@ TENSION_BUILD_BARS  = 16
 HARMONIC_HIGHS_BARS_FAST = 16   # BPM ≥ 120
 HARMONIC_HIGHS_BARS_SLOW = 24   # BPM < 120
 
+# loop_roll: classic loop-roll — loop the last N bars while incoming fades in underneath
+LOOP_ROLL_BARS = 4       # bars per loop cell (phrase-aligned)
+LOOP_ROLL_REPS = 3       # how many times to repeat the cell during the fade-in
+
+# loop_stutter: buffer/stutter roll — halving loop length (4→2→1 bars) before the drop
+LOOP_STUTTER_BARS      = 4   # starting bar count; halves each stage
+LOOP_STUTTER_REPS      = 2   # repetitions at each stage (4×2 + 2×2 + 1×2 bars total)
+LOOP_STUTTER_XFADE_MS  = 20  # tiny crossfade between stutter stitches (tight = more click)
+
 
 # ── Transition helpers ───────────────────────────────────────────────────────
 
@@ -203,7 +212,7 @@ def loop_segment(seg, loop_bars, bpm, beat_times=None):
     loop_audio = AudioSegment.silent(duration=0, frame_rate=SAMPLE_RATE)
     xfade_ms = min(50, len(loop_region) // 4)  # tiny crossfade for seamless joins
 
-    for i in range(LOOP_MAX_REPEATS):
+    for _ in range(LOOP_MAX_REPEATS):
         if len(loop_audio) == 0:
             loop_audio = loop_region
         else:
@@ -961,6 +970,141 @@ def render_tension_drop(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
     return out_body + out_tension + in_head + in_body
 
 
+def render_loop_roll(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+    """
+    Classic DJ loop roll — captures the last N bars of the outgoing track in a
+    repeating loop, then fades the incoming track up underneath it over successive
+    repetitions. The loop and incoming trade volume smoothly so the combined energy
+    stays constant throughout the handoff.
+
+    Timeline:
+      [out_body] [loop_cell × n_reps  ↕ incoming_fade_in] [incoming_body]
+
+    The loop cell is phrase-aligned so the repeat seam lands on a clean downbeat.
+    A tiny crossfade (50 ms) at each loop join prevents clicks.
+    In the second half of the overlap, the outgoing loop loses its bass via a
+    gentle highpass ramp, creating headroom for the incoming kick/sub.
+
+    Select for: smooth energy handoffs between genre-compatible tracks. The loop
+    rewards the crowd with a familiar hook before revealing the new track. Works
+    best at similar BPM (< 6% delta). Camelot rules 1–3.
+    """
+    bpm        = slot_out.get("actual_bpm") or 120.0
+    beat_times = slot_out.get("beat_times") or []
+    loop_bars  = strategy["loop_bars"]
+    n_reps     = strategy["n_reps"]
+
+    loop_ms = bars_to_ms(loop_bars, bpm)
+
+    # Need at least 1.5× the loop length to have a safe out_body before it
+    if len(mix) < loop_ms * 1.5 or len(incoming_seg) < 2000:
+        fade_ms = min(bars_to_ms(4, bpm), len(mix) - 1000, len(incoming_seg) - 1000)
+        fade_ms = max(0, fade_ms)
+        if fade_ms <= 0:
+            return mix + incoming_seg
+        return mix[:-fade_ms] + mix[-fade_ms:].fade_out(fade_ms).overlay(
+            incoming_seg[:fade_ms].fade_in(fade_ms)
+        ) + incoming_seg[fade_ms:]
+
+    # Phrase-align the loop start point
+    raw_start = len(mix) - loop_ms
+    if strategy.get("do_phrase_align") and beat_times:
+        loop_start = find_phrase_boundary(beat_times, raw_start)
+    else:
+        loop_start = raw_start
+    loop_start = max(0, min(loop_start, len(mix) - loop_ms))
+
+    loop_cell = mix[loop_start:]  # from the loop boundary to end of mix
+    out_body  = mix[:loop_start]
+
+    # Build n_reps repetitions with tiny crossfade joins
+    xfade_ms   = min(50, len(loop_cell) // 4)
+    loop_audio = AudioSegment.silent(duration=0, frame_rate=SAMPLE_RATE)
+    for _ in range(n_reps):
+        if len(loop_audio) == 0:
+            loop_audio = loop_cell
+        elif xfade_ms > 0 and len(loop_audio) > xfade_ms and len(loop_cell) > xfade_ms:
+            loop_audio = loop_audio.append(loop_cell, crossfade=xfade_ms)
+        else:
+            loop_audio = loop_audio + loop_cell
+
+    total_ms  = len(loop_audio)
+    inc_head  = incoming_seg[:total_ms]
+    inc_body  = incoming_seg[total_ms:]
+
+    # In the second half of the loop, apply a gentle highpass to the loop to
+    # clear bass headroom for the incoming kick — mirrors how a real DJ EQs
+    half = total_ms // 2
+    if PEDALBOARD_AVAILABLE:
+        centroid   = slot_out.get("spectral_centroid_mean")
+        bass_hz    = compute_crossover_hz(centroid)
+        loop_tail  = apply_highpass_adaptive(loop_audio[half:], bass_hz, 0.0)
+        loop_audio = loop_audio[:half] + loop_tail
+
+    loop_out = loop_audio.fade_out(total_ms)
+    inc_in   = inc_head.fade_in(total_ms)
+    overlap  = loop_out.overlay(inc_in)
+    return out_body + overlap + inc_body
+
+
+def render_loop_stutter(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+    """
+    Buffer stutter roll — the outgoing track is caught in a progressively
+    shorter loop: starting at N bars, halving each stage (N → N/2 → N/4 → 1),
+    with LOOP_STUTTER_REPS repetitions at each stage. This creates the classic
+    CDJ "buffer roll" stuttering effect that builds mounting tension before the
+    hard cut to the incoming drop.
+
+    Timeline:
+      [out_body] [4×2][4×2][2×2][2×2][1×2][1×2] | cut | [incoming fade-in]
+
+    The cut IS the release — the stutter raises energy then drops it clean.
+    A 1-bar fade-in on the incoming head prevents a digital click at the splice
+    while preserving the punch of the drop.
+
+    BPM delta: any — no overlap. Chaos factor: 0.4+.
+    Select for: high-energy climax moments, peak-of-set tension, drops.
+    Avoid on tracks that start with a long intro (needs a hard downbeat).
+    """
+    bpm          = slot_out.get("actual_bpm") or 120.0
+    beat_times   = slot_out.get("beat_times") or []
+    start_bars   = strategy["stutter_bars"]
+    reps_per_len = strategy["reps_per_len"]
+
+    loop_ms   = bars_to_ms(start_bars, bpm)
+    raw_start = max(0, len(mix) - loop_ms)
+
+    # Phrase-align: stutter starts on a clean phrase boundary
+    if strategy.get("do_phrase_align") and beat_times:
+        stutter_start = find_phrase_boundary(beat_times, raw_start)
+    else:
+        stutter_start = raw_start
+    stutter_start = max(0, min(stutter_start, len(mix) - loop_ms))
+
+    out_body      = mix[:stutter_start]
+    stutter_audio = AudioSegment.silent(duration=0, frame_rate=SAMPLE_RATE)
+
+    bars = start_bars
+    xfade_ms = LOOP_STUTTER_XFADE_MS
+    while bars >= 1:
+        region_ms = bars_to_ms(bars, bpm)
+        region    = mix[stutter_start : stutter_start + int(region_ms)]
+        if len(region) < region_ms * 0.5:
+            break
+        for _ in range(reps_per_len):
+            if len(stutter_audio) > xfade_ms and len(region) > xfade_ms:
+                stutter_audio = stutter_audio.append(region, crossfade=xfade_ms)
+            else:
+                stutter_audio = stutter_audio + region
+        bars = bars // 2
+
+    # Hard drop: brief 1-bar fade-in on incoming preserves the punch
+    in_fade_ms = min(bars_to_ms(1, bpm), len(incoming_seg) // 4)
+    in_head    = incoming_seg[:in_fade_ms].fade_in(in_fade_ms)
+    in_body    = incoming_seg[in_fade_ms:]
+    return out_body + stutter_audio + in_head + in_body
+
+
 # ── Transition strategy ──────────────────────────────────────────────────────
 
 def transition_strategy(hint, chaos, preview_mode, bpm=None, quality_mode=False):
@@ -1046,6 +1190,72 @@ def transition_strategy(hint, chaos, preview_mode, bpm=None, quality_mode=False)
             "do_phrase_align": False,
             "fade_ms":         QUICK_FADE_MS,
             "do_eq":           False,
+        }
+
+    if hint == "filter_sweep":
+        sweep_bars = max(8, SWEEP_BARS // 2) if preview_mode else SWEEP_BARS
+        return {
+            "method":          "filter_sweep",
+            "do_stretch":      do_stretch,
+            "do_phrase_align": do_phrase_align,
+            "sweep_ms":        bars_to_ms(sweep_bars, bpm),
+        }
+
+    if hint == "reverb_wash":
+        wash_bars = max(6, REVERB_WASH_BARS // 2) if preview_mode else REVERB_WASH_BARS
+        return {
+            "method":          "reverb_wash",
+            "do_stretch":      do_stretch,
+            "do_phrase_align": do_phrase_align,
+            "wash_ms":         bars_to_ms(wash_bars, bpm),
+        }
+
+    if hint == "harmonic_blend":
+        highs_bars = HARMONIC_HIGHS_BARS_FAST if bpm >= 120 else HARMONIC_HIGHS_BARS_SLOW
+        swap_bars  = PHASE_SWAP_BARS_TIGHT if chaos < 0.5 else PHASE_SWAP_BARS_LOOSE
+        outro_bars = PHASE_OUTRO_BARS
+        if preview_mode:
+            highs_bars = max(4, highs_bars // 2)
+            swap_bars  = 1
+            outro_bars = max(4, outro_bars // 2)
+        return {
+            "method":          "harmonic_blend",
+            "do_stretch":      do_stretch,
+            "do_phrase_align": do_phrase_align,
+            "highs_ms":        bars_to_ms(highs_bars, bpm),
+            "swap_ms":         bars_to_ms(swap_bars,  bpm),
+            "outro_ms":        bars_to_ms(outro_bars, bpm),
+        }
+
+    if hint == "tension_drop":
+        build_bars = max(8, TENSION_BUILD_BARS // 2) if preview_mode else TENSION_BUILD_BARS
+        return {
+            "method":          "tension_drop",
+            "do_stretch":      False,   # intentional — tempo clash adds tension
+            "do_phrase_align": do_phrase_align,
+            "build_ms":        bars_to_ms(build_bars, bpm),
+        }
+
+    if hint == "loop_roll":
+        loop_bars = LOOP_ROLL_BARS
+        n_reps    = max(2, LOOP_ROLL_REPS // 2) if preview_mode else LOOP_ROLL_REPS
+        return {
+            "method":          "loop_roll",
+            "do_stretch":      False,   # loop is same-tempo content — no stretch needed
+            "do_phrase_align": do_phrase_align,
+            "loop_bars":       loop_bars,
+            "n_reps":          n_reps,
+        }
+
+    if hint == "loop_stutter":
+        start_bars   = max(2, LOOP_STUTTER_BARS // 2) if preview_mode else LOOP_STUTTER_BARS
+        reps_per_len = 1 if preview_mode else LOOP_STUTTER_REPS
+        return {
+            "method":          "loop_stutter",
+            "do_stretch":      False,   # no overlap — BPM delta irrelevant
+            "do_phrase_align": do_phrase_align,
+            "stutter_bars":    start_bars,
+            "reps_per_len":    reps_per_len,
         }
 
     # hard_cut
@@ -1248,23 +1458,37 @@ def render_transition(outgoing, incoming, prev_seg_raw, slot_out, slot_in,
                                    quality_mode=quality_mode)
     method   = strategy["method"]
     # ── BPM SAFETY GATE ──────────────────────────────────────────────────────
-    # If BPM delta > 5% and we're NOT going to stretch, force hard_cut.
-    # Overlapping two tracks at different tempos = instant train wreck.
-    if method in ("staged", "crossfade") and bpm_out and bpm_in:
+    # If BPM delta > 5% and we're NOT stretching, overlapping blends train-wreck.
+    # Exceptions: reverb_wash and tension_drop don't overlap, so BPM delta is fine.
+    # filter_sweep's spectral wipe also masks minor tempo clash at <8% delta.
+    overlap_methods = ("staged", "crossfade", "harmonic_blend", "filter_sweep", "loop_roll")
+    if method in overlap_methods and bpm_out and bpm_in:
         bpm_delta_pct = abs(bpm_out - bpm_in) / max(bpm_out, bpm_in)
-        if bpm_delta_pct > BPM_BLEND_SAFETY_PCT and not strategy["do_stretch"]:
-            # Downgrade to hard_cut — clean break is better than tempo clash
+        if bpm_delta_pct > BPM_BLEND_SAFETY_PCT and not strategy.get("do_stretch"):
             strategy = transition_strategy("hard_cut", chaos, preview_mode, bpm=bpm,
                                            quality_mode=quality_mode)
             method   = "hard_cut"
 
     # ── Stem blend — surgical stem-based transition ───────────────────────────
     if hint == "stem_blend" and prev_seg_raw is not None:
-        # Needs long_blend-style strategy regardless of method downgrade
         stem_strategy = transition_strategy("long_blend", chaos, preview_mode,
                                             bpm=bpm, quality_mode=quality_mode)
         return render_stem_blend(outgoing, incoming, prev_seg_raw, slot_out, slot_in,
                                  stem_strategy, chaos, stems_cache)
+
+    # ── New transitions ───────────────────────────────────────────────────────
+    if method == "filter_sweep":
+        return render_filter_sweep(outgoing, incoming, slot_out, slot_in, strategy, chaos)
+    if method == "reverb_wash":
+        return render_reverb_wash(outgoing, incoming, slot_out, slot_in, strategy, chaos)
+    if method == "harmonic_blend":
+        return render_harmonic_blend(outgoing, incoming, slot_out, slot_in, strategy, chaos)
+    if method == "tension_drop":
+        return render_tension_drop(outgoing, incoming, slot_out, slot_in, strategy, chaos)
+    if method == "loop_roll":
+        return render_loop_roll(outgoing, incoming, slot_out, slot_in, strategy, chaos)
+    if method == "loop_stutter":
+        return render_loop_stutter(outgoing, incoming, slot_out, slot_in, strategy, chaos)
 
     # ── Staged DJ transition ──────────────────────────────────────────────────
     if method == "staged":

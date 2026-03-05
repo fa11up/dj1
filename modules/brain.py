@@ -61,21 +61,59 @@ Each key has a number (1–12) and letter (A=minor, B=major). Compatible moves:
 6. Avoid opposite-wheel jumps unless making a deliberate break
 
 ## BPM Mixing Thresholds
-- delta < 4%:  long_blend or stem_blend (beatmatch perfectly, hold the blend)
-- delta 4–8%:  crossfade (time-stretching will compensate)
-- delta 8–12%: quick_fade (brief overlap, let energy shift)
-- delta > 12%: hard_cut only (tempo clash will sound broken if blended)
-- stem_blend:  ONLY when delta < 6% AND tracks are harmonically compatible (rules 1–3 above)
+- delta < 4%:   long_blend, stem_blend, harmonic_blend, or filter_sweep
+- delta 4–8%:   crossfade or filter_sweep (stretch compensates; sweep masks residual clash)
+- delta 8–12%:  quick_fade, reverb_wash, or tension_drop
+- delta > 12%:  hard_cut only (any overlap will sound broken at this delta)
+- stem_blend:   ONLY when delta < 6% AND harmonically compatible (Camelot rules 1–3)
+- harmonic_blend: ONLY when delta < 6% AND Camelot-adjacent (same number ±1 letter, or ±1 number same letter)
+- reverb_wash:  any delta — reverb tail masks all tempo differences
+- tension_drop: any delta — no overlap, the cut is intentional
 
 ## Transition Type Guide
-- stem_blend:  surgical stem-based mix — drums/bass/melody controlled independently.
-               Use for 2–4 signature moments per set. Maximum impact.
-- long_blend:  3-phase EQ blend over 30+ bars. Best for harmonic matches + close BPM.
-               The classic DJ move — sounds professional, smooth.
-- crossfade:   12s overlap. Good for moderate BPM delta or imperfect key match.
-- quick_fade:  4s fade. Use for intentional genre/energy jumps.
-- hard_cut:    Abrupt. Use for dramatic drops, genre breaks, or >12% BPM delta.
-               First track in the set MUST use hard_cut (no previous track).
+
+### Standard blends
+- long_blend:      3-phase EQ blend over 30+ bars. Best for harmonic matches + close BPM.
+                   The classic DJ move. BPM delta < 8%.
+- stem_blend:      Surgical stem-based mix — drums/bass/melody swapped independently.
+                   Use for 2–4 signature moments per set. BPM delta < 6%, Camelot rules 1–3.
+- crossfade:       12s overlapping volume fade + EQ bass-cut. Moderate BPM delta or imperfect key.
+- quick_fade:      4s fade. Intentional genre/energy jumps. Any BPM delta.
+- hard_cut:        Abrupt sequential fade. Dramatic drops, >12% BPM delta, or genre breaks.
+                   First track in the set MUST use hard_cut (no previous track).
+
+### New transitions
+- filter_sweep:    Spectral wipe — mirror filter sweeps exchange the full frequency spectrum.
+                   Outgoing loses bass→mids→highs as incoming gains them simultaneously.
+                   At every moment outgoing + incoming ≈ full spectrum (visually symmetrical).
+                   BPM delta < 8%. High energy sections, momentum buildups, climax approaches.
+- reverb_wash:     Reverb dissolution — outgoing blooms into heavy reverb at its breakdown.
+                   Incoming fades in beneath the wash: an atmospheric, cinematic bridge.
+                   Works for ANY BPM delta (reverb masks tempo differences).
+                   Best for mood shifts, key changes, atmospheric/melancholic passages.
+- harmonic_blend:  Chorus-widened phase swap — same 4-phase structure as long_blend but with
+                   chorus widening on the overlap to blur key differences + widen stereo image.
+                   For relative major/minor pairs (same Camelot number, A↔B = 3 semitones),
+                   incoming is pitch-shifted during the overlap to minimise clash.
+                   BPM delta < 6%. Camelot-adjacent tracks. Peak-of-set moments.
+- tension_drop:    Rising highpass sweeps bass away over 16 bars (mounting anticipation),
+                   then hard-cuts to the incoming's drop at phrase boundary — no overlap.
+                   The cut IS the release. Works best when incoming opens on a hard downbeat.
+                   Any BPM delta. High energy. Chaos factor 0.5+. Genre pivots.
+
+### Loop-based transitions
+- loop_roll:       Classic DJ loop roll — captures the last 4 bars of the outgoing track in a
+                   phrase-aligned loop, repeats it 3× while fading the incoming track up
+                   underneath. Bass is gently rolled off the loop in the second half to clear
+                   headroom for the incoming kick. Crowd hears the familiar hook extended,
+                   then the new track rises beneath it.
+                   BPM delta < 6% (incoming overlaps live). Camelot rules 1–3.
+                   Best for: smooth energy handoffs, building anticipation, peak-of-set flow.
+- loop_stutter:    Buffer stutter roll — loop length halves each stage (4→2→1 bars, 2 reps
+                   each), building stutter tension before a hard cut to the incoming drop.
+                   The cut IS the release — no overlap, BPM delta irrelevant.
+                   Chaos factor 0.4+. High energy. Works best when incoming opens on a drop.
+                   Best for: peak moments, climactic genre pivots, tension-and-release arcs.
 
 ## Energy Arc Principles
 - Start 10–15% below peak energy (give the set room to build)
@@ -125,12 +163,17 @@ _TOOL_INPUT_SCHEMA = {
                     },
                     "transition_hint": {
                         "type": "string",
-                        "enum": ["hard_cut", "quick_fade", "crossfade",
-                                 "long_blend", "stem_blend"],
+                        "enum": [
+                            "hard_cut", "quick_fade", "crossfade",
+                            "long_blend", "stem_blend",
+                            "filter_sweep", "reverb_wash",
+                            "harmonic_blend", "tension_drop",
+                            "loop_roll", "loop_stutter",
+                        ],
                         "description": (
                             "Transition type INTO this track from the previous. "
                             "First track must be hard_cut. "
-                            "stem_blend requires BPM delta <6% and harmonic compatibility."
+                            "See Transition Type Guide for full selection criteria."
                         )
                     },
                     "reasoning": {
