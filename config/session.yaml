@@ -15,18 +15,28 @@ spotify:
 
 # ── Session Shape ─────────────────────────────
 session:
-  duration_minutes: 20
-  energy_curve: "flat"      # flat | ramp_up | peak_valley | festival
-  mood_prompt: "late night, coding, melancholic"               # e.g. "late night, melancholic, driving"
+  mode: "sequential"        # sequential | creative
+  duration_minutes: 7
+  energy_curve: "festival"      # flat | ramp_up | peak_valley | festival
+  mood_prompt: "deep bass, underground, rave"               # e.g. "late night, melancholic, driving"
 
 # ── DJ Behavior ───────────────────────────────
 dj:
-  chaos_factor: 0.1             # 0.0 = safe, 1.0 = wild
-  random_seed: 11             # Set an integer for reproducible runs
-  harmonic_strict: false
+  chaos_factor: 0.3             # 0.0 = safe, 1.0 = wild
+  random_seed: 411            # Set an integer for reproducible runs
+  harmonic_strict: true
   bpm_normalize: true
   tempo_tolerance_bpm: 8
-  transition_style: "blends"     # blends | cuts | mixed
+  transition_style: "mixed"     # blends | cuts | mixed
+
+# ── DJ Brain ──────────────────────────────────
+# provider: anthropic      → requires ANTHROPIC_API_KEY in .env
+# provider: openai_compatible → requires base_url + BRAIN_API_KEY (or "ollama"/"none")
+brain:
+  enabled: true            # true = AI brain plans the setlist
+  provider: anthropic       # anthropic | openai_compatible
+  model: ""                 # override model; blank = provider default (claude-haiku-4-5 / must set for local)
+  base_url: ""              # openai_compatible only, e.g. http://localhost:11434/v1
 
 # ── Output ────────────────────────────────────
 output:

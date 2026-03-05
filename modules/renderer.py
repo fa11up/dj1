@@ -46,7 +46,10 @@ except Exception:
     RUBBERBAND_AVAILABLE = False
 
 try:
-    from pedalboard import Pedalboard, LowpassFilter, HighpassFilter, Gain
+    from pedalboard import (
+        Pedalboard, LowpassFilter, HighpassFilter, Gain,
+        Reverb, Delay, Chorus, Phaser,
+    )
     PEDALBOARD_AVAILABLE = True
 except Exception:
     PEDALBOARD_AVAILABLE = False
@@ -97,6 +100,30 @@ HARD_CUT_TAIL_MS = 2_000
 # Phrase boundary: 8 bars × 4 beats = 32 beats
 PHRASE_BEATS = 32
 BPM_BLEND_SAFETY_PCT = 0.05
+
+# ── New-transition constants ───────────────────────────────────────────────────
+
+# filter_sweep: spectral wipe — mirror filter sweeps hand frequency spectrum from
+#               outgoing to incoming.  Together they always sum to ~full spectrum.
+SWEEP_BARS      = 24      # total overlap bars
+SWEEP_STEPS     = 32      # chunks for smooth filter curve (more = smoother)
+SWEEP_LOW_HZ    = 40.0    # lowest frequency in sweep range
+SWEEP_HIGH_HZ   = 18000.0 # highest frequency in sweep range
+
+# reverb_wash: outgoing blooms into reverb; incoming fades in beneath the wash
+REVERB_ROOM_SIZE    = 0.78
+REVERB_DAMPING      = 0.40
+REVERB_WET          = 0.50
+REVERB_DRY          = 0.50
+REVERB_WASH_BARS    = 16
+
+# tension_drop: rising highpass sweeps bass away over N bars → hard cut to drop
+TENSION_BUILD_BARS  = 16
+
+# harmonic_blend: chorus-widened EQ phase swap for adjacent-key tracks
+# Longer highs phase than long_blend gives more harmonic breathing room
+HARMONIC_HIGHS_BARS_FAST = 16   # BPM ≥ 120
+HARMONIC_HIGHS_BARS_SLOW = 24   # BPM < 120
 
 
 # ── Transition helpers ───────────────────────────────────────────────────────
@@ -559,6 +586,381 @@ def apply_lowpass(seg, cutoff_hz):
         return seg
 
 
+# ── Effect helpers ────────────────────────────────────────────────────────────
+
+def apply_reverb(seg, room_size=REVERB_ROOM_SIZE, damping=REVERB_DAMPING,
+                 wet=REVERB_WET, dry=REVERB_DRY):
+    """Apply reverb bloom via pedalboard. Falls back silently."""
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        board = Pedalboard([Reverb(room_size=room_size, damping=damping,
+                                   wet_level=wet, dry_level=dry)])
+        return float_to_seg(board(seg_to_float(seg), SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
+
+
+def apply_delay(seg, delay_seconds=0.25, feedback=0.35, mix=0.35):
+    """Apply slapback/echo delay via pedalboard."""
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        board = Pedalboard([Delay(delay_seconds=delay_seconds, feedback=feedback, mix=mix)])
+        return float_to_seg(board(seg_to_float(seg), SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
+
+
+def apply_chorus(seg, rate_hz=0.6, depth=0.15, mix=0.45):
+    """Apply chorus for harmonic widening during blends."""
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        board = Pedalboard([Chorus(rate_hz=rate_hz, depth=depth, mix=mix)])
+        return float_to_seg(board(seg_to_float(seg), SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
+
+
+def apply_phaser(seg, rate_hz=0.5, mix=0.40):
+    """Apply phaser for psychoacoustic width."""
+    if not PEDALBOARD_AVAILABLE:
+        return seg
+    try:
+        board = Pedalboard([Phaser(rate_hz=rate_hz, mix=mix)])
+        return float_to_seg(board(seg_to_float(seg), SAMPLE_RATE), seg.channels)
+    except Exception:
+        return seg
+
+
+def pitch_shift_seg(seg, semitones):
+    """
+    Pitch-shift by semitones using pyrubberband. Clamped to ±6 st.
+    Returns original segment if rubberband unavailable or shift < 0.05 st.
+    """
+    if not RUBBERBAND_AVAILABLE or abs(semitones) < 0.05:
+        return seg
+    semitones = max(-6.0, min(6.0, semitones))
+    try:
+        samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+        samples /= (2 ** (seg.sample_width * 8 - 1))
+        if seg.channels == 2:
+            samples = samples.reshape(-1, 2)
+            l = pyrb.pitch_shift(samples[:, 0], SAMPLE_RATE, semitones)
+            r = pyrb.pitch_shift(samples[:, 1], SAMPLE_RATE, semitones)
+            shifted = np.stack([l, r], axis=1).flatten()
+        else:
+            shifted = pyrb.pitch_shift(samples.flatten(), SAMPLE_RATE, semitones)
+        shifted = np.clip(shifted, -1.0, 1.0)
+        pcm = (shifted * (2 ** 15 - 1)).astype(np.int16)
+        return AudioSegment(pcm.tobytes(), frame_rate=SAMPLE_RATE,
+                            sample_width=2, channels=seg.channels)
+    except Exception:
+        return seg
+
+
+def camelot_semitone_distance(cam_out, cam_in):
+    """
+    Return (semitones, direction) for pitch-shifting cam_in toward cam_out.
+
+    Only the two close-key relationships are returned:
+      Same position         → (0,  0)   no shift needed
+      Relative major/minor  → (3, ±1)   A↔B same number = 3 semitones
+
+    Adjacent number (perfect 5th = 7 semitones) → (None, 0): too audible to shift.
+    """
+    if not cam_out or not cam_in:
+        return None, 0
+    try:
+        num_out, let_out = int(cam_out[:-1]), cam_out[-1].upper()
+        num_in,  let_in  = int(cam_in[:-1]),  cam_in[-1].upper()
+    except Exception:
+        return None, 0
+    if num_out == num_in and let_out == let_in:
+        return 0, 0
+    if num_out == num_in and let_out != let_in:
+        # Relative pair: A→B = shift incoming up 3 st; B→A = shift down 3 st
+        direction = 1 if let_in == 'B' else -1
+        return 3, direction
+    return None, 0
+
+
+def sweep_filter(seg, start_hz, end_hz, mode, n_steps=SWEEP_STEPS):
+    """
+    Smooth filter sweep: divide the segment into n_steps chunks, applying a
+    progressively changing cutoff between start_hz and end_hz (log interpolation).
+
+    mode: 'lowpass'  — cutoff controls the top of the passband (outgoing: full→sub)
+          'highpass' — cutoff controls the bottom of the passband (incoming: air→full)
+
+    Falls back to the unprocessed segment if pedalboard is unavailable.
+    """
+    if not PEDALBOARD_AVAILABLE or not len(seg):
+        return seg
+    chunk_ms = len(seg) / n_steps
+    if chunk_ms < 1:
+        return seg
+    result = AudioSegment.empty()
+    for i in range(n_steps):
+        t      = i / max(1, n_steps - 1)
+        cutoff = start_hz * ((end_hz / start_hz) ** t)   # log interp
+        cutoff = max(20.0, min(20000.0, cutoff))
+        s_ms   = int(i * chunk_ms)
+        e_ms   = int((i + 1) * chunk_ms) if i < n_steps - 1 else len(seg)
+        chunk  = seg[s_ms:e_ms]
+        if not chunk:
+            continue
+        try:
+            audio = seg_to_float(chunk)
+            Flt   = LowpassFilter if mode == 'lowpass' else HighpassFilter
+            chunk = float_to_seg(
+                Pedalboard([Flt(cutoff_frequency_hz=cutoff)])(audio, SAMPLE_RATE),
+                chunk.channels,
+            )
+        except Exception:
+            pass
+        result += chunk
+    return result
+
+
+# ── New render functions ──────────────────────────────────────────────────────
+
+def render_filter_sweep(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+    """
+    Spectral wipe: outgoing and incoming swap the frequency spectrum via mirror
+    filter sweeps — at any moment they sum to approximately the full spectrum.
+
+      Outgoing : lowpass  falling 18 kHz → 40 Hz  (full sound → sub-only → gone)
+      Incoming : highpass falling 18 kHz → 40 Hz  (silent → full sound)
+
+    BPM delta up to 8% is acceptable because the sweep masks tempo differences.
+    Best for high-energy sections, momentum buildups, and climax transitions.
+    """
+    bpm        = slot_out.get("actual_bpm") or 120.0
+    sweep_ms   = strategy["sweep_ms"]
+    beat_times = slot_out.get("beat_times") or []
+    sections   = slot_out.get("sections")   or []
+
+    if strategy.get("do_stretch"):
+        bpm_in = slot_in.get("actual_bpm")
+        if bpm_in and bpm:
+            incoming_seg = time_stretch_segment(incoming_seg, bpm_in, bpm)
+
+    bd_ms = find_breakdown_from_sections(sections, track_duration_ms=len(mix))
+    if bd_ms is None or len(mix) - bd_ms < sweep_ms:
+        bd_ms = max(0, len(mix) - sweep_ms)
+    if strategy.get("do_phrase_align") and beat_times:
+        bd_ms = find_phrase_boundary(beat_times, bd_ms)
+    sweep_start = max(0, min(bd_ms, len(mix) - sweep_ms))
+
+    out_body  = mix[:sweep_start]
+    out_sweep = mix[sweep_start : sweep_start + sweep_ms]
+    in_sweep  = incoming_seg[:sweep_ms]
+    in_body   = incoming_seg[sweep_ms:]
+
+    if not PEDALBOARD_AVAILABLE:
+        out_fade = out_sweep.fade_out(sweep_ms)
+        in_fade  = in_sweep.fade_in(sweep_ms)
+        return out_body + out_fade.overlay(in_fade) + in_body
+
+    # Mirror pair — log sweep in opposite directions
+    out_swept = sweep_filter(out_sweep, SWEEP_HIGH_HZ, SWEEP_LOW_HZ, 'lowpass')
+    in_swept  = sweep_filter(in_sweep,  SWEEP_HIGH_HZ, SWEEP_LOW_HZ, 'highpass')
+    # Brief volume envelope at edges prevents digital click
+    edge_ms   = min(1500, sweep_ms // 8)
+    out_swept = out_swept.fade_out(edge_ms)
+    in_swept  = in_swept.fade_in(edge_ms)
+    return out_body + out_swept.overlay(in_swept) + in_body
+
+
+def render_reverb_wash(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+    """
+    Reverb dissolution: at the breakdown, outgoing blooms into heavy reverb.
+    Incoming fades in beneath the wash, creating an atmospheric bridge.
+
+    The reverb tail extends over two halves — moderate then heavy — so the
+    bloom grows naturally rather than snapping to maximum wet at the splice.
+    Works for any BPM delta because the reverb masks tempo differences.
+    Best for mood shifts, key changes, and atmospheric / melancholic passages.
+    """
+    bpm        = slot_out.get("actual_bpm") or 120.0
+    wash_ms    = strategy["wash_ms"]
+    beat_times = slot_out.get("beat_times") or []
+    sections   = slot_out.get("sections")   or []
+
+    if strategy.get("do_stretch"):
+        bpm_in = slot_in.get("actual_bpm")
+        if bpm_in and bpm:
+            incoming_seg = time_stretch_segment(incoming_seg, bpm_in, bpm)
+
+    bd_ms = find_breakdown_from_sections(sections, track_duration_ms=len(mix))
+    if bd_ms is None or len(mix) - bd_ms < wash_ms:
+        bd_ms = max(0, len(mix) - wash_ms)
+    if strategy.get("do_phrase_align") and beat_times:
+        bd_ms = find_phrase_boundary(beat_times, bd_ms)
+    wash_start = max(0, min(bd_ms, len(mix) - wash_ms))
+
+    out_body = mix[:wash_start]
+    out_tail = mix[wash_start : wash_start + wash_ms]
+    in_body  = incoming_seg
+
+    if not PEDALBOARD_AVAILABLE:
+        fade_ms      = min(wash_ms, len(out_tail), len(in_body))
+        out_tail_fad = out_tail[:fade_ms].fade_out(fade_ms)
+        in_head_fad  = in_body[:fade_ms].fade_in(fade_ms)
+        return out_body + out_tail_fad.overlay(in_head_fad) + in_body[fade_ms:]
+
+    # Reverb grows over two halves (moderate → heavy) then fades out
+    half          = max(1, len(out_tail) // 2)
+    out_first     = apply_reverb(out_tail[:half], room_size=0.55, wet=0.30, dry=0.70)
+    out_second    = apply_reverb(out_tail[half:], room_size=REVERB_ROOM_SIZE,
+                                 wet=REVERB_WET, dry=REVERB_DRY)
+    out_wash      = (out_first + out_second).fade_out(wash_ms)
+
+    # Incoming fades in over the full wash window
+    in_fade_ms    = min(wash_ms, len(in_body))
+    in_head       = in_body[:in_fade_ms].fade_in(in_fade_ms)
+    in_rest       = in_body[in_fade_ms:]
+
+    # Pad in_head to match out_wash length for clean overlay
+    pad = len(out_wash) - len(in_head)
+    if pad > 0:
+        in_head = in_head + AudioSegment.silent(duration=pad,
+                                                frame_rate=SAMPLE_RATE).set_channels(CHANNELS)
+    else:
+        in_head = in_head[:len(out_wash)]
+
+    return out_body + out_wash.overlay(in_head) + in_rest
+
+
+def render_harmonic_blend(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+    """
+    Harmonically conscious phase-swap blend.
+
+    Same 4-phase structure as long_blend but with two enhancements:
+      1. Chorus widening on the overlap phases — blurs key differences,
+         widens stereo image, makes the blend feel larger than a simple EQ swap.
+      2. Pitch correction: if the tracks are a relative major/minor pair
+         (same Camelot number, different letter = 3 semitones), the incoming's
+         blend window is pitch-shifted to match the outgoing's key. After the
+         overlap resolves, the incoming plays at its natural pitch.
+
+    Select for: Camelot-adjacent tracks, BPM delta < 6%, peak-of-set moments.
+    """
+    bpm        = slot_out.get("actual_bpm") or 120.0
+    highs_ms   = strategy["highs_ms"]
+    swap_ms    = strategy["swap_ms"]
+    outro_ms   = strategy["outro_ms"]
+    beat_times = slot_out.get("beat_times") or []
+    sections   = slot_out.get("sections")   or []
+
+    centroid = slot_out.get("spectral_centroid_mean")
+    bass_hz  = compute_crossover_hz(centroid)
+    highs_hz = max(400.0, min(1200.0, bass_hz * 4))
+
+    # Pitch-correct incoming blend window for relative major/minor pairs
+    cam_out  = slot_out.get("camelot")
+    cam_in   = slot_in.get("camelot")
+    semitones, direction = camelot_semitone_distance(cam_out, cam_in)
+    if semitones and semitones > 0 and RUBBERBAND_AVAILABLE:
+        blend_len    = highs_ms + swap_ms
+        in_blend     = pitch_shift_seg(incoming_seg[:blend_len], -semitones * direction)
+        incoming_seg = in_blend + incoming_seg[blend_len:]
+
+    if strategy.get("do_stretch"):
+        bpm_in = slot_in.get("actual_bpm")
+        if bpm_in and bpm:
+            incoming_seg = time_stretch_segment(incoming_seg, bpm_in, bpm)
+
+    total_ms = highs_ms + swap_ms + outro_ms
+    bd_ms = find_breakdown_from_sections(sections, track_duration_ms=len(mix))
+    if bd_ms is None or len(mix) - bd_ms < total_ms:
+        bd_ms = max(0, len(mix) - total_ms)
+    if strategy.get("do_phrase_align") and beat_times:
+        bd_ms = find_phrase_boundary(beat_times, bd_ms)
+    p2_start = max(0, min(bd_ms, len(mix) - total_ms))
+    p3_start = p2_start + highs_ms
+    p4_start = p3_start + swap_ms
+
+    out_body = mix[:p2_start]
+    out_p2   = mix[p2_start:p3_start]
+    out_p3   = mix[p3_start:p4_start]
+    out_p4   = mix[p4_start:]
+
+    inc_p2   = incoming_seg[:highs_ms]
+    inc_p3   = incoming_seg[highs_ms : highs_ms + swap_ms]
+    inc_p4   = incoming_seg[highs_ms + swap_ms : highs_ms + swap_ms + outro_ms]
+    inc_body = incoming_seg[highs_ms + swap_ms + outro_ms:]
+
+    # Phase 2: incoming highs + chorus widening over outgoing full
+    inc_p2_hi  = apply_highpass_adaptive(inc_p2, highs_hz, 0.0)
+    inc_p2_ch  = apply_chorus(inc_p2_hi)
+    out_p2_ch  = apply_chorus(out_p2)
+    overlap_p2 = out_p2_ch.overlay(inc_p2_ch)
+
+    # Phase 3: bass swap — tight, no chorus (decisiveness)
+    out_p3_nb  = apply_highpass_adaptive(out_p3, bass_hz, 0.0)
+    overlap_p3 = out_p3_nb.overlay(inc_p3)
+
+    # Phase 4: outgoing highs fade with phaser shimmer, incoming takes over
+    out_p4_hi  = apply_highpass_adaptive(out_p4, highs_hz, 0.0).fade_out(outro_ms)
+    out_p4_ph  = apply_phaser(out_p4_hi)
+    overlap_p4 = inc_p4.overlay(out_p4_ph)
+
+    return out_body + overlap_p2 + overlap_p3 + overlap_p4 + inc_body
+
+
+def render_tension_drop(mix, incoming_seg, slot_out, slot_in, strategy, chaos):
+    """
+    Build-and-release tension: a rising highpass filter sweeps the bass out of
+    the outgoing track over N bars, creating mounting anticipation. At the phrase
+    boundary, the mix hard-cuts to the incoming track's drop — no overlap.
+
+    The cut IS the release. Works best when incoming starts on a hard downbeat.
+    A brief (2-bar) fade-in on the incoming head prevents a digital click at
+    the splice, while preserving the punch of the drop.
+
+    Select for: high-energy climax moments, genre pivots, incoming tracks that
+    open on a big drop. Chaos factor 0.5+. Any BPM delta is acceptable.
+    """
+    bpm        = slot_out.get("actual_bpm") or 120.0
+    build_ms   = strategy["build_ms"]
+    beat_times = slot_out.get("beat_times") or []
+
+    build_start = max(0, len(mix) - build_ms)
+    if strategy.get("do_phrase_align") and beat_times:
+        build_start = find_phrase_boundary(beat_times, build_start)
+    build_start = max(0, min(build_start, len(mix) - build_ms))
+
+    out_body  = mix[:build_start]
+    out_build = mix[build_start:]
+
+    if not PEDALBOARD_AVAILABLE:
+        return out_body + out_build.fade_out(len(out_build)) + incoming_seg
+
+    # Rising highpass: track's natural bass crossover → 8 kHz (full tension)
+    centroid    = slot_out.get("spectral_centroid_mean")
+    bass_hz     = compute_crossover_hz(centroid)
+    out_tension = sweep_filter(out_build, bass_hz, 8000.0, 'highpass', n_steps=SWEEP_STEPS)
+
+    # Slight gain bump during the build (excitement, compensates for lost bass energy)
+    try:
+        audio       = seg_to_float(out_tension)
+        out_tension = float_to_seg(
+            Pedalboard([Gain(gain_db=2.5)])(audio, SAMPLE_RATE),
+            out_tension.channels,
+        )
+    except Exception:
+        pass
+
+    # Hard cut: brief 2-bar fade-in on incoming to avoid click, preserves punch
+    in_fade_ms = min(bars_to_ms(2, bpm), len(incoming_seg) // 4)
+    in_head    = incoming_seg[:in_fade_ms].fade_in(in_fade_ms)
+    in_body    = incoming_seg[in_fade_ms:]
+    return out_body + out_tension + in_head + in_body
+
+
 # ── Transition strategy ──────────────────────────────────────────────────────
 
 def transition_strategy(hint, chaos, preview_mode, bpm=None, quality_mode=False):
@@ -774,11 +1176,17 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
     loop_bars = LOOP_BARS_LONG if bpm < 120 else LOOP_BARS_DEFAULT
     loop_ms   = bars_to_ms(loop_bars, bpm)
 
-    needs_loop = (tail_available_ms < total_ms) or (tail_available_ms < total_ms * 1.2)
+    # Only loop if the tail genuinely lacks enough content for the blend.
+    # The previous `< total_ms * 1.2` was always True (tail_available_ms is
+    # clamped to total_ms), causing looping on every transition.
+    # Also: beat_times are in track-local coordinates, not mix coordinates.
+    # Passing None prevents loop_segment from snapping to a beat in the wrong
+    # timeline (which previously copied 4+ minutes of the accumulated mix).
+    needs_loop = tail_available_ms < total_ms
 
     if needs_loop and loop_ms > 0 and len(outgoing) > loop_ms * 1.5:
         loop_audio, loop_point_ms = loop_segment(
-            outgoing, loop_bars, bpm, beat_times
+            outgoing, loop_bars, bpm, beat_times=None
         )
         if len(loop_audio) > 0:
             outgoing = outgoing[:loop_point_ms] + loop_audio
@@ -814,16 +1222,23 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
     return out_body + overlap_p2 + overlap_p3 + overlap_p4 + inc_body
 
 
-def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode,
-                      quality_mode=False):
+def render_transition(outgoing, incoming, prev_seg_raw, slot_out, slot_in,
+                      chaos, preview_mode, quality_mode=False, stems_cache=None):
     """
     Entry point for all transitions.
     Determines strategy via energy + hint + chaos, dispatches to the
     appropriate render function.
 
-    CHANGED: Added quality_mode parameter. Added BPM safety gate that
-    forces hard_cut when BPM delta is too large and stretching won't happen.
+    outgoing:     accumulated mix buffer (grows with each track)
+    incoming:     the next individual track segment
+    prev_seg_raw: the previous individual track segment (same audio as the
+                  tail of `outgoing`, but in its own timeline — used for
+                  stem-based transitions where we need track-local coordinates)
+    stems_cache:  dict {track_id: {stem_name: path}} for stem_blend transitions
     """
+    if stems_cache is None:
+        stems_cache = {}
+
     hint     = slot_in.get("transition_hint", "crossfade")
     hint     = energy_aware_hint(hint, outgoing, incoming)
     bpm_out  = slot_out.get("actual_bpm")
@@ -832,7 +1247,6 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
     strategy = transition_strategy(hint, chaos, preview_mode, bpm=bpm,
                                    quality_mode=quality_mode)
     method   = strategy["method"]
-
     # ── BPM SAFETY GATE ──────────────────────────────────────────────────────
     # If BPM delta > 5% and we're NOT going to stretch, force hard_cut.
     # Overlapping two tracks at different tempos = instant train wreck.
@@ -844,6 +1258,14 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
                                            quality_mode=quality_mode)
             method   = "hard_cut"
 
+    # ── Stem blend — surgical stem-based transition ───────────────────────────
+    if hint == "stem_blend" and prev_seg_raw is not None:
+        # Needs long_blend-style strategy regardless of method downgrade
+        stem_strategy = transition_strategy("long_blend", chaos, preview_mode,
+                                            bpm=bpm, quality_mode=quality_mode)
+        return render_stem_blend(outgoing, incoming, prev_seg_raw, slot_out, slot_in,
+                                 stem_strategy, chaos, stems_cache)
+
     # ── Staged DJ transition ──────────────────────────────────────────────────
     if method == "staged":
         return render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=chaos)
@@ -851,10 +1273,8 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
     # ── Simple crossfade ──────────────────────────────────────────────────────
     fade_ms = strategy["fade_ms"]
     fade_ms = max(0, min(fade_ms, len(outgoing) - 1000, len(incoming) - 1000))
-
     if fade_ms <= 0:
         return outgoing + incoming
-
     if method == "hard_cut":
         # Sequential tail-fade + head-fade — breath between tracks, no overlap
         out_body = outgoing[:-fade_ms]
@@ -862,11 +1282,9 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
         in_head  = incoming[:fade_ms].fade_in(fade_ms)
         in_body  = incoming[fade_ms:]
         return out_body + out_tail + in_head + in_body
-
     # crossfade / quick_fade — overlap the fade regions
     if strategy.get("do_stretch"):
         incoming = _stretch_incoming(incoming, bpm_in, bpm_out, fade_ms)
-
     if strategy.get("do_eq") and PEDALBOARD_AVAILABLE:
         centroid     = slot_out.get("spectral_centroid_mean")
         bass_hz      = compute_crossover_hz(centroid)
@@ -877,7 +1295,6 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
         in_head_eq   = apply_highpass_adaptive(in_head_raw,  bass_hz, 0.0)
         outgoing  = outgoing[:-fade_ms] + out_tail_eq
         incoming  = in_head_eq + incoming[fade_ms:]
-
     out_body = outgoing[:-fade_ms]
     out_tail = outgoing[-fade_ms:].fade_out(fade_ms)
     in_head  = incoming[:fade_ms].fade_in(fade_ms)
@@ -886,17 +1303,133 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
     return out_body + overlap + in_body
 
 
-def render_session(setlist, chaos, preview_mode, progress_cb=None, quality_mode=False):
+# ── Stem blend transition ─────────────────────────────────────────────────────
+
+def render_stem_blend(mix, incoming_seg, prev_seg_raw, slot_out, slot_in,
+                      strategy, chaos, stems_cache):
+    """
+    Surgical stem-based DJ transition.
+
+    Instead of EQ filter approximations (highpass/lowpass), uses actual demucs
+    stems for the outgoing and incoming tracks to perform a precise mix:
+
+      Phase 2 — incoming melody/vocals (other+vocals) enter over outgoing full
+      Phase 3 — bass swap: outgoing bass exits, incoming bass enters
+      Phase 4 — outgoing drums+highs fade, incoming plays full range
+
+    Falls back to render_staged() if stems are unavailable for either track.
+
+    prev_seg_raw: the INDIVIDUAL outgoing track (not accumulated mix) — needed
+                  to load its stems and correctly time the transition window.
+    """
+    from modules.stems import load_stems
+
+    out_id = slot_out.get("track_id", "")
+    in_id  = slot_in.get("track_id",  "")
+
+    out_stem_paths = stems_cache.get(out_id)
+    in_stem_paths  = stems_cache.get(in_id)
+
+    if not out_stem_paths or not in_stem_paths:
+        # Stems unavailable — degrade gracefully to standard staged blend
+        print(f"\n  ⚠  stem_blend: stems missing, falling back to long_blend")
+        return render_staged(mix, incoming_seg, slot_out, slot_in, strategy, chaos=chaos)
+
+    out_stems = load_stems(out_stem_paths)
+    in_stems  = load_stems(in_stem_paths)
+
+    if not out_stems or not in_stems:
+        print(f"\n  ⚠  stem_blend: stem load failed, falling back to long_blend")
+        return render_staged(mix, incoming_seg, slot_out, slot_in, strategy, chaos=chaos)
+
+    # ── Phase timing (same as staged) ────────────────────────────────────────
+    bpm      = slot_out.get("actual_bpm") or 120.0
+    highs_ms = strategy["highs_ms"]
+    swap_ms  = strategy["swap_ms"]
+    outro_ms = strategy["outro_ms"]
+    total_ms = highs_ms + swap_ms + outro_ms
+
+    # Clamp to available audio
+    max_out  = max(4000, len(prev_seg_raw) - 2000)
+    max_in   = max(4000, len(incoming_seg) - 2000)
+    total_ms = min(total_ms, max_out, max_in)
+    swap_ms  = max(500, min(swap_ms,  total_ms // 4))
+    highs_ms = max(500, min(highs_ms, (total_ms - swap_ms) // 2))
+    outro_ms = max(500, total_ms - highs_ms - swap_ms)
+
+    # Time-stretch if enabled
+    if strategy.get("do_stretch"):
+        bpm_in  = slot_in.get("actual_bpm")
+        bpm_out = slot_out.get("actual_bpm")
+        incoming_seg = _stretch_incoming(incoming_seg, bpm_in, bpm_out, total_ms)
+        for name in ("drums", "bass", "other", "vocals"):
+            if name in in_stems:
+                in_stems[name] = _stretch_incoming(in_stems[name], bpm_in, bpm_out, total_ms)
+
+    # ── Slice stems to their respective phase windows ─────────────────────────
+    # Outgoing stems: take the last `total_ms` from prev_seg_raw timeline
+    out_total_ms = len(prev_seg_raw)
+    out_t_start  = max(0, out_total_ms - total_ms)
+
+    out_p2_drums = out_stems["drums"][out_t_start : out_t_start + highs_ms]
+    out_p2_bass  = out_stems["bass"] [out_t_start : out_t_start + highs_ms]
+    out_p2_mel   = out_stems["other"][out_t_start : out_t_start + highs_ms]
+
+    out_p3_start = out_t_start + highs_ms
+    out_p3_drums = out_stems["drums"][out_p3_start : out_p3_start + swap_ms]
+    out_p3_bass  = out_stems["bass"] [out_p3_start : out_p3_start + swap_ms]
+    out_p3_mel   = out_stems["other"][out_p3_start : out_p3_start + swap_ms]
+
+    out_p4_start = out_p3_start + swap_ms
+    out_p4_drums = out_stems["drums"][out_p4_start : out_p4_start + outro_ms]
+    out_p4_mel   = out_stems["other"][out_p4_start : out_p4_start + outro_ms]
+
+    # Incoming stems: take the first `total_ms`
+    in_p2_mel    = in_stems["other"] [:highs_ms]
+    in_p3_bass   = in_stems["bass"]  [highs_ms : highs_ms + swap_ms]
+    in_p3_drums  = in_stems["drums"] [highs_ms : highs_ms + swap_ms]
+    in_p3_mel    = in_stems["other"] [highs_ms : highs_ms + swap_ms]
+    in_p4_mel    = in_stems["other"] [highs_ms + swap_ms : highs_ms + swap_ms + outro_ms]
+    in_body      = incoming_seg[total_ms:]
+
+    # ── Mix each phase ────────────────────────────────────────────────────────
+    # Phase 2: outgoing full (drums+bass+melody) + incoming melody only
+    out_p2_full = out_p2_drums.overlay(out_p2_bass).overlay(out_p2_mel)
+    overlap_p2  = out_p2_full.overlay(in_p2_mel)
+
+    # Phase 3: bass swap — outgoing drums+melody, incoming bass+drums
+    out_p3_no_bass = out_p3_drums.overlay(out_p3_mel)
+    in_p3_full     = in_p3_drums.overlay(in_p3_bass).overlay(in_p3_mel)
+    overlap_p3     = out_p3_no_bass.overlay(in_p3_full)
+
+    # Phase 4: outgoing melody fades, incoming full plays
+    out_p4_fade  = out_p4_drums.overlay(out_p4_mel).fade_out(outro_ms)
+    in_p4_full   = incoming_seg[highs_ms + swap_ms : highs_ms + swap_ms + outro_ms]
+    overlap_p4   = in_p4_full.overlay(out_p4_fade)
+
+    # Mix body: everything in accumulated `mix` up to transition start
+    mix_body = mix[: len(mix) - total_ms] if len(mix) > total_ms else mix[:0]
+
+    return mix_body + overlap_p2 + overlap_p3 + overlap_p4 + in_body
+
+
+def render_session(setlist, chaos, preview_mode, progress_cb=None, quality_mode=False,
+                   stems_cache=None):
     """
     Render all slots into a single AudioSegment.
     progress_cb(position, total, filename) called per track if provided.
 
-    CHANGED: quality_mode is now threaded through to render_transition().
+    stems_cache: optional dict {track_id: {drums/bass/other/vocals: path}}
+                 passed through to render_transition for stem_blend transitions.
     """
-    mix      = None
-    prev_seg = None
+    if stems_cache is None:
+        stems_cache = {}
+
+    mix       = None
+    prev_seg  = None
     prev_slot = None
-    total    = len(setlist)
+    total     = len(setlist)
+
     for i, slot in enumerate(setlist):
         if progress_cb:
             progress_cb(i, total, slot["filename"])
@@ -905,15 +1438,20 @@ def render_session(setlist, chaos, preview_mode, progress_cb=None, quality_mode=
             print(f"  ⚠  Skipping {slot['filename']} (could not load)")
             continue
         seg = trim_to_cues(seg, slot.get("intro_end_sec"), slot.get("outro_start_sec"))
-        # Normalise loudness per track
         seg = pydub_normalize(seg)
+
         if mix is None:
             mix = seg
         else:
-            mix = render_transition(mix, seg, prev_slot, slot, chaos, preview_mode,
-                                    quality_mode=quality_mode)
+            mix = render_transition(
+                mix, seg, prev_seg, prev_slot, slot,
+                chaos, preview_mode,
+                quality_mode=quality_mode,
+                stems_cache=stems_cache,
+            )
         prev_seg  = seg
         prev_slot = slot
+
     return mix
 
 
@@ -954,10 +1492,11 @@ def print_progress(position, total, filename, start_time):
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(
-    session_path  = "./data/session.json",
-    output_path   = None,
-    preview_mode  = False,
-    quality_mode  = False,
+    session_path    = "./data/session.json",
+    output_path     = None,
+    preview_mode    = False,
+    quality_mode    = False,
+    stems_cache_dir = "./data/.stems_cache",
 ):
     print("─" * 60 + "\n  AutoDJ — Module 5: Renderer\n" + "─" * 60)
 
@@ -1004,14 +1543,28 @@ def run(
 
     print(f"\n  {'─' * 56}")
 
+    # ── Pre-process: separate stems for stem_blend transitions ────────────────
+    has_stem_blend = any(s.get("transition_hint") == "stem_blend" for s in setlist)
+    stems_cache    = {}
+    if has_stem_blend:
+        from modules.stems import run_stems_for_setlist, demucs_available
+        # stems_cache_dir passed as parameter (or defaulted above)
+        if demucs_available():
+            stems_cache = run_stems_for_setlist(setlist, stems_cache_dir)
+        else:
+            print(
+                "  ⚠  stem_blend transitions requested but demucs not found in PATH.\n"
+                "     Install demucs (Python 3.12): pip install demucs\n"
+                "     stem_blend will degrade to long_blend."
+            )
+
     start_time = time.time()
 
     def progress(pos, total, fname):
         print_progress(pos + 1, total, fname, start_time)
 
-    # CHANGED: pass quality_mode through to render_session
     mix = render_session(setlist, chaos, preview_mode, progress_cb=progress,
-                         quality_mode=quality_mode)
+                         quality_mode=quality_mode, stems_cache=stems_cache)
 
     print(f"\r  {'─' * 56}")
 

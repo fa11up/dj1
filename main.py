@@ -97,6 +97,7 @@ def resolve_paths(config, config_path):
         "matched_tracks_json": str(data_dir / "matched_tracks.json"),
         "session_json":        str(data_dir / "session.json"),
         "analysis_cache":      str(data_dir / ".analysis_cache"),
+        "stems_cache":         str(data_dir / ".stems_cache"),
     }
 
 
@@ -180,6 +181,28 @@ def run_module_5(paths, config, preview_mode=False, quality_mode=False, output_f
         output_path=output_file,
         preview_mode=preview_mode,
         quality_mode=quality_mode,
+        stems_cache_dir=paths["stems_cache"],
+    )
+
+
+def run_creative(paths, config, preview_mode=False, quality_mode=False, output_file=None):
+    """Creative mode: replaces Modules 4+5 when session.mode == 'creative'."""
+    from modules.creative import run as creative_run
+
+    if output_file is None:
+        output_cfg = config.get("output", {})
+        fmt        = output_cfg.get("format", "mp3")
+        suffix     = "_preview" if preview_mode else "_creative"
+        timestamp  = datetime.now().strftime("%Y%m%d_%H%M")
+        output_file = str(Path(paths["output_dir"]) / f"mix_{timestamp}{suffix}.{fmt}")
+
+    return creative_run(
+        analysis_path=paths["analysis_json"],
+        config_path=args_config_path,
+        stems_cache_dir=paths["stems_cache"],
+        output_path=output_file,
+        preview_mode=preview_mode,
+        quality_mode=quality_mode,
     )
 
 
@@ -230,6 +253,8 @@ def run_pipeline(config_path, from_module=1, preview_mode=False,
     # ── Run modules ───────────────────────────────────────────────────────────
     results = {}
 
+    session_mode = config.get("session", {}).get("mode", "sequential")
+
     for num, label, runner in MODULES:
         if num < from_module:
             print(f"\n  {dim(f'Module {num}: {label} — skipped (--from-module {from_module})')}")
@@ -241,7 +266,15 @@ def run_pipeline(config_path, from_module=1, preview_mode=False,
 
         module_start = time.time()
         try:
-            if num == 5:
+            if num == 4 and session_mode == "creative":
+                # Creative mode replaces Modules 4+5 in one call
+                label = "Creative Mode (4+5)"
+                result = run_creative(paths, config, preview_mode, quality_mode, output_file)
+                module_elapsed = time.time() - module_start
+                results[5] = {"status": "ok", "elapsed": module_elapsed, "result": result}
+                print(f"\n  {green('✓')} Creative mode completed in {module_elapsed:.1f}s")
+                break  # skip Module 5
+            elif num == 5:
                 result = runner(paths, config, preview_mode, quality_mode, output_file)
             else:
                 result = runner(paths, config)

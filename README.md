@@ -5,8 +5,6 @@ track, seeds a session from a Spotify playlist, plans a setlist with harmonic
 mixing and energy curve logic, then renders a continuous mix to a single audio
 file — with real DJ-style transitions.
 
-Phase 1 is complete and producing working mixes.
-
 ---
 
 ## System Dependencies
@@ -16,6 +14,13 @@ Install these before Python packages:
 ```bash
 brew install ffmpeg       # required by pydub (MP3/AAC/M4A loading + export)
 brew install rubberband   # required by pyrubberband (BPM time-stretching)
+```
+
+For stem-based transitions (`stem_blend`), demucs is also required:
+
+```bash
+pip install demucs        # needs Python 3.12 or earlier (no 3.14 wheels yet)
+# or: brew install demucs
 ```
 
 ---
@@ -30,10 +35,9 @@ cd ~/dj1
 uv sync
 # or: pip install -r requirements.txt
 
-# 3. Set up Spotify credentials (optional)
+# 3. Set up credentials
 cp .env.example .env
-# Edit .env with your Spotify Client ID + Secret
-# Add http://127.0.0.1:8000/callback to your Spotify app's redirect URIs
+# Edit .env — add Spotify and/or AI brain keys (see sections below)
 ```
 
 ---
@@ -86,7 +90,10 @@ dj1/
 │   ├── analyzer.py            # Module 2: BPM, key, energy, beat grid
 │   ├── spotify_bridge.py      # Module 3: Spotify playlist → local match
 │   ├── planner.py             # Module 4: Setlist + energy curve logic
-│   └── renderer.py            # Module 5: Mix rendering + DJ transitions
+│   ├── brain.py               # Module 4b: AI setlist planner (optional)
+│   ├── renderer.py            # Module 5: Mix rendering + DJ transitions
+│   ├── stems.py               # Module 5b: Stem separation via demucs (optional)
+│   └── creative.py            # Creative mode: full-session stem composition
 ├── tests/
 │   ├── test_ingestor.py
 │   ├── test_analyzer.py
@@ -97,10 +104,11 @@ dj1/
 │   ├── tracks.json            # Module 1 output
 │   ├── analysis.json          # Module 2 output
 │   ├── matched_tracks.json    # Module 3 output
-│   └── session.json           # Module 4 output
+│   ├── session.json           # Module 4 output
+│   └── .stems_cache/          # Demucs stem cache (per track_id)
 ├── output/                    # Rendered mixes (gitignored)
-├── .env.example               # Spotify credential template
-└── requirements.txt
+├── .env.example               # Credential template
+└── pyproject.toml
 ```
 
 ---
@@ -108,16 +116,39 @@ dj1/
 ## Configuration (`config/session.yaml`)
 
 ```yaml
+paths:
+  music_dir: "~/Music/library"  # your local music folder
+  data_dir: "./data"
+  output_dir: "./output"
+
+spotify:
+  enabled: true
+  playlist_ids: ["<playlist_id_or_url>"]
+  match_threshold: 55           # 0–100, lower = more permissive matching
+
 session:
+  mode: sequential              # sequential | creative
   duration_minutes: 60
-  energy_curve: festival      # flat | ramp_up | peak_valley | festival
+  energy_curve: festival        # flat | ramp_up | peak_valley | festival
+  mood_prompt: ""               # e.g. "late night, melancholic, driving"
 
 dj:
-  chaos_factor: 0.3           # 0.0 = safe/predictable  1.0 = wild
-  random_seed: null           # integer for reproducible run, null for fresh
-  harmonic_strict: false      # true = Camelot wheel only, no exceptions
-  tempo_tolerance_bpm: 8      # BPM window for transition scoring
-  transition_style: mixed     # blends | cuts | mixed
+  chaos_factor: 0.3             # 0.0 = safe/predictable  1.0 = wild
+  random_seed: null             # integer for reproducible run, null for fresh
+  harmonic_strict: false        # true = Camelot wheel only, no exceptions
+  bpm_normalize: true           # snap double/half-time BPM outliers
+  tempo_tolerance_bpm: 8        # BPM window for transition scoring
+  transition_style: mixed       # blends | cuts | mixed
+
+brain:
+  enabled: false                # true = AI plans the setlist
+  provider: anthropic           # anthropic | openai_compatible
+  model: ""                     # model name override (see below)
+  base_url: ""                  # openai_compatible only
+
+output:
+  format: mp3                   # wav | mp3
+  bitrate: "320k"
 ```
 
 **`chaos_factor`** is the main dial. It controls:
@@ -125,6 +156,94 @@ dj:
 - Track selection (low chaos → tightest harmonic/BPM fit; high chaos → adventurous)
 - Transition style (low chaos → full staged DJ pipeline; high chaos → raw cuts)
 - EQ filter shape (low chaos → hard/steep; high chaos → gentle shelf)
+
+**`session.mode`**
+- `sequential` — standard planner: ordered setlist, one track at a time
+- `creative` — stem composition mode: four channels (drums / bass / melody / vocals) sourced independently from different tracks and mixed bar-by-bar. Requires the brain and demucs.
+
+---
+
+## DJ Brain
+
+The brain replaces the heuristic setlist planner with a single AI API call (tool
+use / function calling). It reads the full track library metadata and
+`mood_prompt`, then returns a harmonically and energetically considered setlist
+as structured JSON.
+
+The planner falls back to the algorithmic path silently if the brain is
+unavailable, misconfigured, or returns a bad response.
+
+### Option A — Claude via Anthropic API
+
+```yaml
+brain:
+  enabled: true
+  provider: anthropic
+  model: ""          # blank = claude-haiku-4-5 (fast + cheap). Try claude-sonnet-4-6 for quality.
+```
+
+`.env`:
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Option B — Local model via Ollama
+
+Start Ollama with a model that supports tool use (Qwen3, Mistral, Llama 3.1+):
+
+```bash
+ollama pull qwen3:latest
+ollama serve         # starts on http://localhost:11434 by default
+```
+
+`session.yaml`:
+```yaml
+brain:
+  enabled: true
+  provider: openai_compatible
+  model: qwen3:latest
+  base_url: http://localhost:11434/v1
+```
+
+`.env`:
+```
+BRAIN_API_KEY=ollama
+```
+
+### Option C — Local model via llama.cpp server
+
+```bash
+llama-server -m /path/to/qwen3-8b.gguf --port 8080
+```
+
+`session.yaml`:
+```yaml
+brain:
+  enabled: true
+  provider: openai_compatible
+  model: qwen3-8b       # matches whatever name the server reports
+  base_url: http://localhost:8080/v1
+```
+
+`.env`:
+```
+BRAIN_API_KEY=none
+```
+
+> The `openai` Python package is required for `openai_compatible` providers:
+> `pip install openai`
+
+### Model recommendations
+
+| Goal | Model |
+|------|-------|
+| Fast, cheap cloud | `claude-haiku-4-5` (default) |
+| Best quality cloud | `claude-sonnet-4-6` |
+| Local, tool-use capable | `qwen3:latest`, `llama3.1:8b`, `mistral:7b-instruct` |
+
+Smaller local models work but may occasionally hallucinate track IDs — the
+re-hydrator discards any unknown IDs and the planner falls back if fewer than
+2 valid tracks remain.
 
 ---
 
@@ -155,6 +274,16 @@ House tracks get a higher crossover (~120–150Hz).
 
 Filter shape: cascaded (hard/steep) at low chaos, single shelf (gentle) at high chaos.
 
+### Stem blend (`stem_blend`)
+
+When demucs is installed, `stem_blend` separates both tracks into
+drums / bass / melody / vocals and mixes channels independently.
+Each stem is time-stretched to the master BPM before mixing.
+Used for 2–4 signature moments per set. Requires BPM delta < 6% and harmonic
+compatibility (Camelot rules 1–3).
+
+Stems are cached under `data/.stems_cache/` so separation only runs once per track.
+
 ### Other transition types
 - **`crossfade`** — overlapping volume fade with EQ bass-cut at low chaos
 - **`quick_fade`** — short volume fade, no EQ
@@ -180,7 +309,7 @@ uv run python tests/test_renderer.py
 
 ---
 
-## Phase 1 Status
+## Status
 
 | Module | Description | Status |
 |--------|-------------|--------|
@@ -188,18 +317,20 @@ uv run python tests/test_renderer.py
 | 2. Analyzer | BPM, key, Camelot, energy curve, beat grid | ✅ Complete |
 | 3. Spotify Bridge | Playlist fetch, fuzzy match to local library | ✅ Complete |
 | 4. Session Planner | Setlist, energy curves, harmonic mixing, chaos | ✅ Complete |
+| 4b. Brain | AI setlist planner — Anthropic + local model support | ✅ Complete |
 | 5. Renderer | Staged transitions, EQ swap, BPM stretch, mix export | ✅ Complete |
-
-Phase 2 planning document: `PHASE2.md`
+| 5b. Stems | Demucs stem separation + caching for stem_blend | ✅ Complete |
+| Creative Mode | Full-session stem composition across 4 channels | 🚧 In progress |
 
 ---
 
-## Known Limitations (Phase 1)
+## Known Limitations
 
 - BPM detection occasionally reports half-time or double-time values (e.g. 156 BPM
-  that should be 78). The renderer trusts the analyzer; correction is a Phase 2 item.
+  that should be 78). The renderer trusts the analyzer; correction is a future item.
 - Spotify `/audio-features` endpoint is restricted by Spotify since late 2024.
   Module 3 uses local analysis only — Spotify provides track names for matching only.
+- demucs has no Python 3.14 wheels as of early 2026. Use Python 3.12 for stem blends,
+  or install demucs via homebrew/conda and ensure it's in PATH.
 - Loop-based transitions (extend a 4-bar loop before the incoming track enters)
-  are stubbed for Phase 2.
-- Sample/soundbite injection is a Phase 2 feature.
+  are planned for a future phase.

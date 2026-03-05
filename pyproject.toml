@@ -11,19 +11,15 @@ dependencies = [
     "aubio>=0.4.9",
     "soundfile>=0.12.1",
     "numpy>=1.26.4",
-
     # ── Audio Manipulation & Effects ───────────────
     "pydub>=0.25.1",
     "pedalboard>=0.9.9",
     "pyrubberband>=0.3.0",
-
     # ── Metadata ───────────────────────────────────
     "mutagen>=1.47.0",
-
     # ── Spotify Integration ────────────────────────
     "spotipy>=2.24.0",
     "python-dotenv>=1.0.1",
-
     # ── Matching & Utilities ───────────────────────
     "thefuzz>=0.22.1",
     "python-levenshtein>=0.25.1",
@@ -32,6 +28,8 @@ dependencies = [
     "tqdm>=4.66.4",
     "colorama>=0.4.6",
     "rich>=13.7.1",
+    "anthropic>=0.84.0",
+    "torchcodec>=0.10.0",
 ]
 
 [project.scripts]

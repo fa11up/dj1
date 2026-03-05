@@ -226,21 +226,17 @@ def build_session(analyses, seed_ids, config, rng):
     """
     sess     = config.get("session", {})
     dj       = config.get("dj", {})
-
     duration_min      = sess.get("duration_minutes", 60)
     chaos             = float(dj.get("chaos_factor", 0.3))
     harmonic_strict   = bool(dj.get("harmonic_strict", False))
     tempo_tolerance   = float(dj.get("tempo_tolerance_bpm", 8))
     transition_style  = dj.get("transition_style", "mixed")
     bpm_normalize     = bool(dj.get("bpm_normalize", False))
-
     # NEW: Read the explicit energy curve from YAML
     explicit_curve    = sess.get("energy_curve")
-
     # Choose which BPM field to use for scoring and output
     # When bpm_normalize is on, prefer the corrected value from the analyzer
     bpm_field = "bpm_normalised" if bpm_normalize else "bpm"
-
     # Filter to tracks that actually have usable analysis
     pool = [a for a in analyses if not a.get("analysis_error") and a.get("bpm")]
 
@@ -441,11 +437,27 @@ def run(
     print()
 
     # ── Build setlist ─────────────────────────────────────────────────────────
-    result = build_session(analyses, seed_ids, config, rng)
-    if not result:
-        sys.exit("✗ No session could be planned — check your track pool.")
+    # Brain path: try Claude API first, fall back to algorithmic planner
+    avg_track_sec = 240.0
+    target_n      = max(4, int((duration_min * 60) / avg_track_sec))
 
-    setlist, curve_type = result
+    brain_cfg = config.get("brain", {})
+    setlist   = None
+    curve_type = None
+
+    if brain_cfg.get("enabled", False):
+        from modules.brain import plan_session as brain_plan
+        brain_result = brain_plan(analyses, seed_ids, config, target_n)
+        if brain_result is not None:
+            setlist, curve_type = brain_result
+        else:
+            print("  Brain: falling back to algorithmic planner\n")
+
+    if setlist is None:
+        result = build_session(analyses, seed_ids, config, rng)
+        if not result:
+            sys.exit("✗ No session could be planned — check your track pool.")
+        setlist, curve_type = result
 
     print_setlist(setlist, curve_type, duration_min)
 
@@ -461,8 +473,9 @@ def run(
         # NEW: config values written to session.json for downstream modules
         "transition_style": transition_style,
         "bpm_normalize":    bpm_normalize,
-        "mood_prompt":      mood_prompt,        # pass-through for Claude integration
-        "energy_curve_cfg": energy_curve_cfg,   # what the user asked for in YAML
+        "mood_prompt":      mood_prompt,
+        "energy_curve_cfg": energy_curve_cfg,
+        "brain_enabled":    brain_cfg.get("enabled", False),
         "setlist":          setlist,
     }
 
