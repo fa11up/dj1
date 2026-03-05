@@ -27,6 +27,7 @@ from datetime import datetime
 import numpy as np
 import yaml
 
+VALID_CURVES = {"flat", "ramp_up", "peak_valley", "festival", "random"}
 # ── Camelot compatibility ─────────────────────────────────────────────────────
 
 def camelot_compatible(a, b):
@@ -95,12 +96,19 @@ def make_energy_curve(n, curve_type, chaos=0.0, rng=None):
     return [round(float(v), 3) for v in base]
 
 
-def choose_curve(chaos, rng):
+def choose_curve(chaos, rng, explicit_curve=None):
     """
-    At high chaos, pick the curve randomly.
-    At low chaos, default to festival.
-    Chaos > 0.7 → fully random curve choice.
+    Decide which energy curve to use.
+    CHANGED: If explicit_curve is a valid curve name from the YAML config,
+    use it directly. Only fall back to chaos-based randomization when the
+    curve is "auto", None, or not a recognized value.
+    This fixes the bug where setting energy_curve: "peak_valley" in YAML
+    was ignored and the planner picked "festival" randomly.
     """
+    # If the user explicitly set a valid curve in YAML, respect it
+    if explicit_curve and explicit_curve in VALID_CURVES:
+        return explicit_curve
+    # "auto" or missing — original chaos-based logic
     if chaos >= 0.7:
         return rng.choice(["ramp_up", "peak_valley", "festival", "flat", "random"])
     if chaos >= 0.4:
@@ -108,9 +116,11 @@ def choose_curve(chaos, rng):
     return "festival"
 
 
+
 # ── Track scoring ─────────────────────────────────────────────────────────────
 
-def score_candidate(candidate, prev_track, target_energy, tempo_tolerance, harmonic_strict, chaos, rng):
+def score_candidate(candidate, prev_track, target_energy, tempo_tolerance,
+                    harmonic_strict, chaos, rng, bpm_field="bpm"):
     """
     Score a candidate track (0–100) for placement after prev_track at a given
     target_energy. Higher = better fit.
@@ -120,13 +130,14 @@ def score_candidate(candidate, prev_track, target_energy, tempo_tolerance, harmo
       - Harmonic compat   (30 pts) — Camelot wheel compatibility with prev track
       - BPM proximity     (20 pts) — within tempo_tolerance_bpm
       - Chaos wildcard    (10 pts) — random bonus scaled to chaos_factor
+
+    CHANGED: Uses bpm_field parameter to select which BPM value to compare.
+    When bpm_normalize is on, this will be "_plan_bpm" (the corrected value).
     """
     score = 0.0
 
     # ── Energy proximity ──────────────────────────────────────────────────────
     cand_energy = candidate.get("energy", {}).get("mean", 0.5) or 0.5
-    # Normalise raw RMS (typically 0.01–0.15) to 0–1 for comparison
-    # We use a rough log scale: 0.005 → ~0, 0.10 → ~1
     energy_norm = min(1.0, max(0.0, (math.log(max(cand_energy, 0.001)) - math.log(0.005)) /
                                      (math.log(0.15) - math.log(0.005))))
     energy_score = max(0.0, 1.0 - abs(energy_norm - target_energy) * 2)
@@ -138,25 +149,25 @@ def score_candidate(candidate, prev_track, target_energy, tempo_tolerance, harmo
         if compat:
             score += 30
         elif not harmonic_strict:
-            score += 10  # partial credit for close-enough
+            score += 10
     else:
-        score += 20  # first track gets neutral harmonic score
+        score += 20
 
-    # ── BPM proximity ─────────────────────────────────────────────────────────
-    if prev_track and prev_track.get("bpm") and candidate.get("bpm"):
-        bpm_delta = abs(prev_track["bpm"] - candidate["bpm"])
+    # ── BPM proximity (uses normalised BPM when available) ────────────────────
+    cand_bpm = candidate.get(bpm_field) or candidate.get("bpm")
+    prev_bpm = (prev_track.get(bpm_field) or prev_track.get("bpm")) if prev_track else None
+
+    if prev_bpm and cand_bpm:
+        bpm_delta = abs(prev_bpm - cand_bpm)
         if bpm_delta <= tempo_tolerance:
             score += 20 * (1 - bpm_delta / tempo_tolerance)
-        # else 0 pts — outside window
     else:
-        score += 10  # neutral if no BPM data
+        score += 10
 
     # ── Chaos wildcard ────────────────────────────────────────────────────────
     score += rng.uniform(0, chaos * 10)
 
     return round(score, 2)
-
-
 # ── Transition hints ──────────────────────────────────────────────────────────
 
 def transition_hint(prev_track, next_track, style):
@@ -205,7 +216,13 @@ def build_session(analyses, seed_ids, config, rng):
     config:    parsed session.yaml dict
     rng:       seeded Random instance
 
-    Returns list of session slot dicts.
+    Returns (setlist, curve_type) tuple.
+
+    CHANGED:
+    - Reads session.energy_curve from config → passes to choose_curve()
+    - Reads dj.bpm_normalize → uses bpm_normalised field from analysis
+    - Reads dj.transition_style (already worked, just documenting)
+    - Passes mood_prompt through for session.json output
     """
     sess     = config.get("session", {})
     dj       = config.get("dj", {})
@@ -215,6 +232,14 @@ def build_session(analyses, seed_ids, config, rng):
     harmonic_strict   = bool(dj.get("harmonic_strict", False))
     tempo_tolerance   = float(dj.get("tempo_tolerance_bpm", 8))
     transition_style  = dj.get("transition_style", "mixed")
+    bpm_normalize     = bool(dj.get("bpm_normalize", False))
+
+    # NEW: Read the explicit energy curve from YAML
+    explicit_curve    = sess.get("energy_curve")
+
+    # Choose which BPM field to use for scoring and output
+    # When bpm_normalize is on, prefer the corrected value from the analyzer
+    bpm_field = "bpm_normalised" if bpm_normalize else "bpm"
 
     # Filter to tracks that actually have usable analysis
     pool = [a for a in analyses if not a.get("analysis_error") and a.get("bpm")]
@@ -223,8 +248,20 @@ def build_session(analyses, seed_ids, config, rng):
         print("  ✗ No usable tracks in analysis pool.")
         return []
 
-    # ── Decide energy curve ────────────────────────────────────────────────────
-    curve_type = choose_curve(chaos, rng)
+    # ── Resolve BPM for each track ────────────────────────────────────────────
+    # Ensure every track has the chosen BPM field available.
+    # Fall back to raw bpm if bpm_normalised is missing (pre-P2 analysis cache).
+    for track in pool:
+        if bpm_normalize and not track.get("bpm_normalised"):
+            # Analysis was run before P2-2 normalisation — fall back to raw
+            track["_plan_bpm"] = track.get("bpm")
+        elif bpm_normalize:
+            track["_plan_bpm"] = track.get("bpm_normalised")
+        else:
+            track["_plan_bpm"] = track.get("bpm")
+
+    # ── Decide energy curve — FIXED: respect YAML value ───────────────────────
+    curve_type = choose_curve(chaos, rng, explicit_curve=explicit_curve)
 
     # Estimate how many tracks fit in the session duration
     avg_track_sec  = 240.0  # assume 4 min average
@@ -234,6 +271,10 @@ def build_session(analyses, seed_ids, config, rng):
     energy_targets = make_energy_curve(target_n, curve_type, chaos=chaos, rng=rng)
 
     print(f"  Curve: {curve_type}  |  Target slots: {target_n}  |  Pool: {len(pool)} tracks")
+    if explicit_curve and explicit_curve in VALID_CURVES:
+        print(f"  (energy_curve from YAML: '{explicit_curve}')")
+    if bpm_normalize:
+        print(f"  BPM normalisation: ON (using corrected BPM values)")
 
     # ── Seed track prioritisation ──────────────────────────────────────────────
     seed_pool  = [a for a in pool if a["track_id"] in seed_ids]
@@ -265,15 +306,20 @@ def build_session(analyses, seed_ids, config, rng):
         scored = sorted(
             candidates,
             key=lambda c: score_candidate(c, prev_track, target_energy,
-                                          tempo_tolerance, harmonic_strict, chaos, rng),
+                                          tempo_tolerance, harmonic_strict, chaos, rng,
+                                          bpm_field="_plan_bpm"),
             reverse=True,
         )
         chosen = rng.choice(scored[:top_n])
 
+        # Use the planning BPM for delta calculation
+        plan_bpm = chosen.get("_plan_bpm") or chosen.get("bpm")
+        prev_plan_bpm = (prev_track.get("_plan_bpm") or prev_track.get("bpm")) if prev_track else None
+
         bpm_delta_pct = 0.0
-        if prev_track and prev_track.get("bpm") and chosen.get("bpm"):
+        if prev_plan_bpm and plan_bpm:
             bpm_delta_pct = round(
-                abs(prev_track["bpm"] - chosen["bpm"]) / prev_track["bpm"] * 100, 1
+                abs(prev_plan_bpm - plan_bpm) / prev_plan_bpm * 100, 1
             )
 
         setlist.append({
@@ -281,7 +327,8 @@ def build_session(analyses, seed_ids, config, rng):
             "track_id":        chosen["track_id"],
             "filepath":        chosen["filepath"],
             "filename":        chosen["filename"],
-            "actual_bpm":      chosen.get("bpm"),
+            "actual_bpm":      plan_bpm,           # CHANGED: uses normalised BPM when enabled
+            "bpm_raw":         chosen.get("bpm"),   # NEW: always include raw for reference
             "camelot":         chosen.get("camelot"),
             "key_name":        chosen.get("key_name"),
             "mode":            chosen.get("mode"),
@@ -290,6 +337,9 @@ def build_session(analyses, seed_ids, config, rng):
             "danceability":    chosen.get("danceability"),
             "intro_end_sec":   chosen.get("intro_end_sec"),
             "outro_start_sec": chosen.get("outro_start_sec"),
+            "beat_times":      chosen.get("beat_times"),
+            "spectral_centroid_mean": chosen.get("spectral_centroid_mean"),
+            "sections":        chosen.get("sections"),
             "transition_hint": transition_hint(prev_track, chosen, transition_style),
             "bpm_delta_pct":   bpm_delta_pct,
             "is_seed":         chosen["track_id"] in seed_ids,
@@ -363,9 +413,16 @@ def run(
 
     # ── RNG setup ─────────────────────────────────────────────────────────────
     dj           = config.get("dj", {})
+    sess         = config.get("session", {})
     random_seed  = dj.get("random_seed")
     chaos        = float(dj.get("chaos_factor", 0.3))
-    duration_min = config.get("session", {}).get("duration_minutes", 60)
+    duration_min = sess.get("duration_minutes", 60)
+
+    # NEW: Read config values that were previously ignored
+    mood_prompt      = sess.get("mood_prompt")         # pass-through for Claude integration
+    transition_style = dj.get("transition_style", "mixed")
+    bpm_normalize    = bool(dj.get("bpm_normalize", False))
+    energy_curve_cfg = sess.get("energy_curve")        # now actually used!
 
     if random_seed is not None:
         rng = random.Random(random_seed)
@@ -374,32 +431,46 @@ def run(
         rng = random.Random()
 
     print(f"  Chaos factor: {chaos}  |  Duration: {duration_min} min")
-    print(f"  Pool: {len([a for a in analyses if not a.get('analysis_error')])} usable tracks\n")
+    print(f"  Pool: {len([a for a in analyses if not a.get('analysis_error')])} usable tracks")
+    if energy_curve_cfg:
+        print(f"  Energy curve (YAML): {energy_curve_cfg}")
+    if mood_prompt:
+        print(f"  Mood prompt: \"{mood_prompt}\"")
+    if bpm_normalize:
+        print(f"  BPM normalisation: enabled")
+    print()
 
     # ── Build setlist ─────────────────────────────────────────────────────────
     result = build_session(analyses, seed_ids, config, rng)
     if not result:
         sys.exit("✗ No session could be planned — check your track pool.")
+
     setlist, curve_type = result
 
     print_setlist(setlist, curve_type, duration_min)
 
     # ── Write output ──────────────────────────────────────────────────────────
     output = {
-        "generated_at":   datetime.now().isoformat(),
-        "curve_type":     curve_type,
-        "chaos_factor":   chaos,
-        "random_seed":    random_seed,
-        "duration_min":   duration_min,
-        "total_tracks":   len(setlist),
-        "seed_count":     sum(1 for s in setlist if s.get("is_seed")),
-        "setlist":        setlist,
+        "generated_at":     datetime.now().isoformat(),
+        "curve_type":       curve_type,
+        "chaos_factor":     chaos,
+        "random_seed":      random_seed,
+        "duration_min":     duration_min,
+        "total_tracks":     len(setlist),
+        "seed_count":       sum(1 for s in setlist if s.get("is_seed")),
+        # NEW: config values written to session.json for downstream modules
+        "transition_style": transition_style,
+        "bpm_normalize":    bpm_normalize,
+        "mood_prompt":      mood_prompt,        # pass-through for Claude integration
+        "energy_curve_cfg": energy_curve_cfg,   # what the user asked for in YAML
+        "setlist":          setlist,
     }
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(json.dumps(output, indent=2, ensure_ascii=False))
     print(f"  ✅ session.json → {Path(output_path).resolve()}\n" + "─" * 60)
     return output
+
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

@@ -96,6 +96,7 @@ HARD_CUT_TAIL_MS = 2_000
 
 # Phrase boundary: 8 bars × 4 beats = 32 beats
 PHRASE_BEATS = 32
+BPM_BLEND_SAFETY_PCT = 0.05
 
 
 # ── Transition helpers ───────────────────────────────────────────────────────
@@ -560,35 +561,57 @@ def apply_lowpass(seg, cutoff_hz):
 
 # ── Transition strategy ──────────────────────────────────────────────────────
 
-def transition_strategy(hint, chaos, preview_mode, bpm=None):
+def transition_strategy(hint, chaos, preview_mode, bpm=None, quality_mode=False):
     """
     Return a strategy dict describing how to execute the transition.
 
+    CHANGED: quality_mode now controls stretch/phrase-align/EQ independently
+    of chaos. Chaos only affects musical choices (swap bar count), NOT
+    pipeline quality.
+
     For long_blend:  staged 3-phase DJ transition (the real deal)
-    For crossfade:   simple overlapping volume fade with EQ at low chaos
+    For crossfade:   simple overlapping volume fade with EQ
     For quick_fade:  short volume fade, no EQ
     For hard_cut:    sequential tail-fade + head-fade, no overlap
 
     Returns:
         {
-          "method":        "staged" | "crossfade" | "quick_fade" | "hard_cut"
-          "do_stretch":    bool
+          "method":          "staged" | "crossfade" | "quick_fade" | "hard_cut"
+          "do_stretch":      bool
           "do_phrase_align": bool
+          "do_eq":           bool       (for crossfade)
           # staged only:
-          "highs_ms":      int   phase 2 duration
-          "swap_ms":       int   phase 3 duration
-          "outro_ms":      int   phase 4 duration
+          "highs_ms":        int   phase 2 duration
+          "swap_ms":         int   phase 3 duration
+          "outro_ms":        int   phase 4 duration
           # simple only:
-          "fade_ms":       int
+          "fade_ms":         int
         }
     """
     bpm = bpm or 120.0
 
-    do_stretch      = RUBBERBAND_AVAILABLE and not preview_mode and chaos < 0.5
-    do_phrase_align = not preview_mode and chaos < 0.7
+    # ── Quality gates — chaos no longer degrades these ────────────────────────
+    # In quality mode: always stretch, always phrase-align, always EQ
+    # In default mode: stretch + EQ if libraries available, phrase-align yes
+    # In preview mode: no stretch, no phrase-align, shorter phases
+    if preview_mode:
+        do_stretch      = False
+        do_phrase_align = False
+        do_eq           = False
+    elif quality_mode:
+        do_stretch      = RUBBERBAND_AVAILABLE
+        do_phrase_align = True
+        do_eq           = PEDALBOARD_AVAILABLE
+    else:
+        # Default mode — use libs if available, no chaos gate
+        do_stretch      = RUBBERBAND_AVAILABLE
+        do_phrase_align = True
+        do_eq           = PEDALBOARD_AVAILABLE
 
     if hint == "long_blend":
         highs_bars = PHASE_HIGHS_BARS_FAST if bpm >= 120 else PHASE_HIGHS_BARS_SLOW
+        # Chaos affects swap bar count — a musical choice:
+        # low chaos = tight 2-bar swap (decisive), high chaos = loose 4-bar (messy but fun)
         swap_bars  = PHASE_SWAP_BARS_TIGHT if chaos < 0.5 else PHASE_SWAP_BARS_LOOSE
         outro_bars = PHASE_OUTRO_BARS
         if preview_mode:
@@ -605,13 +628,13 @@ def transition_strategy(hint, chaos, preview_mode, bpm=None):
         }
 
     if hint == "crossfade":
-        fade_ms = min(CROSSFADE_MS, CROSSFADE_MS // 2 if preview_mode else CROSSFADE_MS)
+        fade_ms = CROSSFADE_MS // 2 if preview_mode else CROSSFADE_MS
         return {
             "method":          "crossfade",
             "do_stretch":      do_stretch,
             "do_phrase_align": False,
             "fade_ms":         fade_ms,
-            "do_eq":           PEDALBOARD_AVAILABLE and chaos < 0.5,
+            "do_eq":           do_eq,
         }
 
     if hint == "quick_fade":
@@ -657,8 +680,8 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
                (tight at low chaos, loose at high chaos)
       Phase 4  incoming plays full-range; outgoing highs/mids fade out
 
-    EQ crossover derived from spectral centroid (adaptive per track).
-    Filter shape: hard (cascaded) at low chaos, shelf (gentle) at high chaos.
+    CHANGED: EQ filters always use steep/cascaded mode. The old chaos-gated
+    shelf mode was causing bass bleed and muddiness in transitions.
     """
     bpm        = slot_out.get("actual_bpm") or 120.0
     beat_times = slot_out.get("beat_times") or []
@@ -680,7 +703,6 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
     )
 
     if breakdown_ms_from_sections is not None and beat_times:
-        # Sections found a breakdown — use it
         phrase_ms = find_phrase_boundary(beat_times, breakdown_ms_from_sections)
         phrase_ms = min(phrase_ms, int(len(outgoing) * 0.82))
         total_available = len(outgoing) - phrase_ms
@@ -698,19 +720,16 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
         breakdown_idx = find_breakdown_point(energy_curve, outro_start_ratio=0.55)
         if breakdown_idx is not None and beat_times:
             breakdown_ms = segment_idx_to_ms(breakdown_idx, len(outgoing))
-            # Now find the next phrase boundary at or after the breakdown
             phrase_ms = find_phrase_boundary(beat_times, breakdown_ms)
             phrase_ms = min(phrase_ms, int(len(outgoing) * 0.82))
             total_available = len(outgoing) - phrase_ms
             if total_available >= total_ms * 0.5:
-                # Good — we have room. Redistribute if needed.
                 if total_available < total_ms:
                     scale    = total_available / total_ms
                     highs_ms = int(highs_ms * scale)
                     swap_ms  = max(int(swap_ms * scale), 500)
                     outro_ms = int(outro_ms * scale)
                     total_ms = highs_ms + swap_ms + outro_ms
-            # else: breakdown too late in track, fall through to normal phrase align
 
     # ── Phrase align the splice point (if breakdown search didn't already) ────
     elif strategy["do_phrase_align"] and beat_times:
@@ -729,14 +748,12 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
     max_out  = max(4000, len(outgoing) - 2000)
     max_in   = max(4000, len(incoming) - 2000)
     total_ms = min(total_ms, max_out, max_in)
-    # Ensure phases fit inside total_ms with minimum viable swap
     swap_ms  = max(500, min(swap_ms,  total_ms // 4))
     highs_ms = max(500, min(highs_ms, (total_ms - swap_ms) // 2))
     outro_ms = max(500, total_ms - highs_ms - swap_ms)
     # Re-clamp total to actual sum of phases
     total_ms = highs_ms + swap_ms + outro_ms
     total_ms = min(total_ms, max_out, max_in)
-    # Final phase redistribution to honour clamped total
     phase_sum = highs_ms + swap_ms + outro_ms
     if phase_sum > total_ms and phase_sum > 0:
         ratio    = total_ms / phase_sum
@@ -754,12 +771,9 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
     p2_start_tentative = max(0, len(outgoing) - total_ms)
     tail_available_ms  = len(outgoing) - p2_start_tentative
 
-    # Decide loop length: 8 bars for slow BPM, 4 bars for fast
     loop_bars = LOOP_BARS_LONG if bpm < 120 else LOOP_BARS_DEFAULT
     loop_ms   = bars_to_ms(loop_bars, bpm)
 
-    # Loop if: (a) not enough outgoing content for the blend, or
-    #          (b) always loop to keep energy steady during transition
     needs_loop = (tail_available_ms < total_ms) or (tail_available_ms < total_ms * 1.2)
 
     if needs_loop and loop_ms > 0 and len(outgoing) > loop_ms * 1.5:
@@ -767,57 +781,68 @@ def render_staged(outgoing, incoming, slot_out, slot_in, strategy, chaos=0.3):
             outgoing, loop_bars, bpm, beat_times
         )
         if len(loop_audio) > 0:
-            # Splice: keep outgoing up to the loop point, then append loop
-            # This extends the outgoing track with repeated bars
             outgoing = outgoing[:loop_point_ms] + loop_audio
 
     # ── Slice regions ──────────────────────────────────────────────────────────
-    # outgoing: body | phase2_region | phase3_region | (ends)
     p2_start = max(0, len(outgoing) - (highs_ms + swap_ms + outro_ms))
     p3_start = p2_start + highs_ms
     p4_start = p3_start + swap_ms
 
-    out_body  = outgoing[:p2_start]                # plays alone
-    out_p2    = outgoing[p2_start:p3_start]        # full range, incoming highs on top
-    out_p3    = outgoing[p3_start:p4_start]        # bass cut here (swap point)
-    out_p4    = outgoing[p4_start:]                # highs fade out, incoming takes over
+    out_body  = outgoing[:p2_start]
+    out_p2    = outgoing[p2_start:p3_start]
+    out_p3    = outgoing[p3_start:p4_start]
+    out_p4    = outgoing[p4_start:]
 
-    inc_p2    = incoming[:highs_ms]                # highs only (bass cut)
-    inc_p3    = incoming[highs_ms:highs_ms+swap_ms] # bass comes in
-    inc_p4    = incoming[highs_ms+swap_ms:highs_ms+swap_ms+outro_ms]  # full range
-    inc_body  = incoming[highs_ms+swap_ms+outro_ms:]  # rest of track, unmodified
+    inc_p2    = incoming[:highs_ms]
+    inc_p3    = incoming[highs_ms:highs_ms+swap_ms]
+    inc_p4    = incoming[highs_ms+swap_ms:highs_ms+swap_ms+outro_ms]
+    inc_body  = incoming[highs_ms+swap_ms+outro_ms:]
 
     # ── Phase 2: incoming highs only over outgoing full range ─────────────────
-    # Strip bass+mids from incoming — crowd hears a shimmering layer on top
-    inc_p2_hi  = apply_highpass_adaptive(inc_p2, highs_hz, chaos)
+    # CHANGED: always use chaos=0.0 for steep filter — no shelf mode
+    inc_p2_hi  = apply_highpass_adaptive(inc_p2, highs_hz, 0.0)
     overlap_p2 = out_p2.overlay(inc_p2_hi)
-
     # ── Phase 3: bass swap — decisive, tight window ───────────────────────────
-    # Cut outgoing bass, bring in incoming bass simultaneously.
-    # Two basslines playing together = mud. This is the critical handoff.
-    out_p3_nobase = apply_highpass_adaptive(out_p3, bass_hz, chaos)
-    inc_p3_full   = inc_p3  # incoming enters full range (bass now present)
+    # CHANGED: always steep EQ
+    out_p3_nobase = apply_highpass_adaptive(out_p3, bass_hz, 0.0)
+    inc_p3_full   = inc_p3
     overlap_p3    = out_p3_nobase.overlay(inc_p3_full)
-
     # ── Phase 4: outgoing highs fade out, incoming full range ─────────────────
-    # Outgoing highs linger briefly then dissolve — incoming fully takes over
-    out_p4_hi  = apply_highpass_adaptive(out_p4, highs_hz, chaos).fade_out(outro_ms)
+    # CHANGED: always steep EQ
+    out_p4_hi  = apply_highpass_adaptive(out_p4, highs_hz, 0.0).fade_out(outro_ms)
     overlap_p4 = inc_p4.overlay(out_p4_hi)
-
     return out_body + overlap_p2 + overlap_p3 + overlap_p4 + inc_body
 
 
-def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode):
+def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode,
+                      quality_mode=False):
     """
     Entry point for all transitions.
     Determines strategy via energy + hint + chaos, dispatches to the
     appropriate render function.
+
+    CHANGED: Added quality_mode parameter. Added BPM safety gate that
+    forces hard_cut when BPM delta is too large and stretching won't happen.
     """
     hint     = slot_in.get("transition_hint", "crossfade")
     hint     = energy_aware_hint(hint, outgoing, incoming)
-    bpm      = slot_out.get("actual_bpm") or slot_in.get("actual_bpm")
-    strategy = transition_strategy(hint, chaos, preview_mode, bpm=bpm)
+    bpm_out  = slot_out.get("actual_bpm")
+    bpm_in   = slot_in.get("actual_bpm")
+    bpm      = bpm_out or bpm_in or 120.0
+    strategy = transition_strategy(hint, chaos, preview_mode, bpm=bpm,
+                                   quality_mode=quality_mode)
     method   = strategy["method"]
+
+    # ── BPM SAFETY GATE ──────────────────────────────────────────────────────
+    # If BPM delta > 5% and we're NOT going to stretch, force hard_cut.
+    # Overlapping two tracks at different tempos = instant train wreck.
+    if method in ("staged", "crossfade") and bpm_out and bpm_in:
+        bpm_delta_pct = abs(bpm_out - bpm_in) / max(bpm_out, bpm_in)
+        if bpm_delta_pct > BPM_BLEND_SAFETY_PCT and not strategy["do_stretch"]:
+            # Downgrade to hard_cut — clean break is better than tempo clash
+            strategy = transition_strategy("hard_cut", chaos, preview_mode, bpm=bpm,
+                                           quality_mode=quality_mode)
+            method   = "hard_cut"
 
     # ── Staged DJ transition ──────────────────────────────────────────────────
     if method == "staged":
@@ -840,8 +865,6 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
 
     # crossfade / quick_fade — overlap the fade regions
     if strategy.get("do_stretch"):
-        bpm_in  = slot_in.get("actual_bpm")
-        bpm_out = slot_out.get("actual_bpm")
         incoming = _stretch_incoming(incoming, bpm_in, bpm_out, fade_ms)
 
     if strategy.get("do_eq") and PEDALBOARD_AVAILABLE:
@@ -849,8 +872,9 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
         bass_hz      = compute_crossover_hz(centroid)
         out_tail_raw = outgoing[-fade_ms:]
         in_head_raw  = incoming[:fade_ms]
-        out_tail_eq  = apply_highpass_adaptive(out_tail_raw, bass_hz, chaos)
-        in_head_eq   = apply_highpass_adaptive(in_head_raw,  bass_hz, chaos)
+        # CHANGED: always use steep EQ (chaos=0.0) — gentle shelf causes bleed
+        out_tail_eq  = apply_highpass_adaptive(out_tail_raw, bass_hz, 0.0)
+        in_head_eq   = apply_highpass_adaptive(in_head_raw,  bass_hz, 0.0)
         outgoing  = outgoing[:-fade_ms] + out_tail_eq
         incoming  = in_head_eq + incoming[fade_ms:]
 
@@ -862,40 +886,36 @@ def render_transition(outgoing, incoming, slot_out, slot_in, chaos, preview_mode
     return out_body + overlap + in_body
 
 
-def render_session(setlist, chaos, preview_mode, progress_cb=None):
+def render_session(setlist, chaos, preview_mode, progress_cb=None, quality_mode=False):
     """
     Render all slots into a single AudioSegment.
     progress_cb(position, total, filename) called per track if provided.
+
+    CHANGED: quality_mode is now threaded through to render_transition().
     """
     mix      = None
     prev_seg = None
     prev_slot = None
     total    = len(setlist)
-
     for i, slot in enumerate(setlist):
         if progress_cb:
             progress_cb(i, total, slot["filename"])
-
         seg = load_track(slot["filepath"], preview_mode)
         if seg is None:
             print(f"  ⚠  Skipping {slot['filename']} (could not load)")
             continue
-
         seg = trim_to_cues(seg, slot.get("intro_end_sec"), slot.get("outro_start_sec"))
-
         # Normalise loudness per track
         seg = pydub_normalize(seg)
-
         if mix is None:
-            # First track — no transition
             mix = seg
         else:
-            mix = render_transition(mix, seg, prev_slot, slot, chaos, preview_mode)
-
+            mix = render_transition(mix, seg, prev_slot, slot, chaos, preview_mode,
+                                    quality_mode=quality_mode)
         prev_seg  = seg
         prev_slot = slot
-
     return mix
+
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
@@ -959,7 +979,7 @@ def run(
         timestamp   = datetime.now().strftime("%Y%m%d_%H%M")
         output_path = f"./output/mix_{timestamp}{suffix}.{fmt}"
 
-    mode_str = "PREVIEW (fast)" if preview_mode else "QUALITY (full pipeline)"
+    mode_str = "PREVIEW (fast)" if preview_mode else "QUALITY (full pipeline)" if quality_mode else "DEFAULT"
 
     print(f"\n  Tracks:       {len(setlist)}")
     print(f"  Duration:     ~{duration} min")
@@ -971,7 +991,12 @@ def run(
           f"librosa={'✓' if LIBROSA_AVAILABLE else '✗ (no beat-align)'}")
 
     # Warn about degraded pipeline
-    if not preview_mode and not quality_mode:
+    if quality_mode:
+        if not RUBBERBAND_AVAILABLE:
+            print(f"\n  ⚠  pyrubberband not available — time-stretching disabled even in quality mode")
+        if not PEDALBOARD_AVAILABLE:
+            print(f"  ⚠  pedalboard not available — EQ swap disabled even in quality mode")
+    elif not preview_mode:
         if not RUBBERBAND_AVAILABLE:
             print(f"\n  ⚠  pyrubberband not available — time-stretching disabled")
         if not PEDALBOARD_AVAILABLE:
@@ -984,7 +1009,9 @@ def run(
     def progress(pos, total, fname):
         print_progress(pos + 1, total, fname, start_time)
 
-    mix = render_session(setlist, chaos, preview_mode, progress_cb=progress)
+    # CHANGED: pass quality_mode through to render_session
+    mix = render_session(setlist, chaos, preview_mode, progress_cb=progress,
+                         quality_mode=quality_mode)
 
     print(f"\r  {'─' * 56}")
 

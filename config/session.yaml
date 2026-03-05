@@ -22,7 +22,7 @@ session:
 # ── DJ Behavior ───────────────────────────────
 dj:
   chaos_factor: 0.1             # 0.0 = safe, 1.0 = wild
-  random_seed: 1             # Set an integer for reproducible runs
+  random_seed: 11             # Set an integer for reproducible runs
   harmonic_strict: false
   bpm_normalize: true
   tempo_tolerance_bpm: 8
